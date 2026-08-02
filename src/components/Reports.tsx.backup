@@ -1,0 +1,443 @@
+import { useState, useEffect, useRef } from 'react';
+import { FileText, AlertTriangle, Loader2, MoreVertical, Edit2, Trash2, Upload } from 'lucide-react';
+import { Case } from '../context/CasesContext';
+import { useCases } from '../context/CasesContext';
+import { Modal } from './Modal';
+
+interface ReportsProps {
+  caseData: Case;
+}
+
+interface ReportFile {
+  filename: string;
+  url: string;
+}
+
+interface ReportsApiResponse {
+  files: ReportFile[];
+}
+
+export function Reports({ caseData }: ReportsProps) {
+  const [reports, setReports] = useState<ReportFile[]>([]);
+  const [selectedReport, setSelectedReport] = useState<ReportFile | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [openMenuIndex, setOpenMenuIndex] = useState<number | null>(null);
+  const [showUploadModal, setShowUploadModal] = useState(false);
+  const [uploadingFiles, setUploadingFiles] = useState<File[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<string>('');
+  const [isUploading, setIsUploading] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { verifyReport } = useCases();
+
+  // Fetch reports from S3 API
+  useEffect(() => {
+    const fetchReports = async () => {
+      // Step 1: Check report_status
+      const status = caseData.reportStatus;
+      
+      // If reports are still processing, don't fetch
+      if (status === 'processing' || status === 'anonymizing') {
+        return; // Don't set loading, just return
+      }
+
+      // Only fetch if status is unverified or verified
+      if (status !== 'unverified' && status !== 'verified') {
+        return;
+      }
+
+      // Additional Validation (Mandatory): Check if we have request_id
+      // This is a hard stop condition - must run after report_status validation
+      if (!caseData.requestId || caseData.requestId.trim() === '') {
+        setError('Oh sorry, but your reports are not available.');
+        return;
+      }
+
+      // Step 2: Fetch reports from API
+      setLoading(true);
+      setError(null);
+
+      try {
+        const response = await fetch(
+          `https://gzgrswe52e.execute-api.ap-south-1.amazonaws.com/dev/get-reports?request_id=${caseData.requestId}`
+        );
+
+        if (!response.ok) {
+          throw new Error('Failed to fetch reports');
+        }
+
+        const data: ReportsApiResponse = await response.json();
+
+        setReports(data.files || []);
+
+        // Step 4: Auto-select first report
+        if (data.files && data.files.length > 0) {
+          setSelectedReport(data.files[0]);
+        }
+      } catch (err) {
+        console.error('Error fetching reports:', err);
+        setError('Unable to load reports right now. Please try again later.');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchReports();
+  }, [caseData.reportStatus, caseData.requestId]);
+
+  const handleVerifyReports = async () => {
+    setIsVerifying(true);
+    try {
+      await verifyReport(caseData.id);
+    } catch (error) {
+      console.error('Failed to verify reports:', error);
+      alert('Failed to verify reports. Please try again.');
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  // Close menu when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+        setOpenMenuIndex(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const handleEditReport = (report: ReportFile) => {
+    // TODO: Implement edit functionality
+    console.log('Edit report:', report);
+    setOpenMenuIndex(null);
+  };
+
+  const handleDeleteReport = (report: ReportFile) => {
+    // TODO: Implement delete functionality
+    console.log('Delete report:', report);
+    setOpenMenuIndex(null);
+  };
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    
+    const fileArray = Array.from(files);
+    setUploadingFiles(fileArray);
+    setShowUploadModal(true);
+    
+    // Reset input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const handleUploadFiles = async () => {
+    if (!caseData.requestId || uploadingFiles.length === 0) {
+      alert('No files selected or request ID missing');
+      return;
+    }
+
+    setIsUploading(true);
+    setUploadProgress('Getting upload configuration...');
+
+    try {
+      // Step 1: Get upload configuration using existing request_id
+      const response = await fetch('https://gzgrswe52e.execute-api.ap-south-1.amazonaws.com/dev/get-upload-urls', {
+        method: 'POST',
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to get upload configuration');
+      }
+
+      const data = await response.json();
+      const uploadUrl = data.upload.url;
+      const uploadFields = data.upload.fields || {};
+      
+      // Use the case's existing request_id for the upload prefix
+      const uploadPrefix = `uploads/${caseData.requestId}/data/`;
+
+      // Step 2: Upload each file to S3
+      for (let i = 0; i < uploadingFiles.length; i++) {
+        const file = uploadingFiles[i];
+        setUploadProgress(`Uploading ${i + 1} of ${uploadingFiles.length}: ${file.name}...`);
+
+        const formData = new FormData();
+        const fileKey = `${uploadPrefix}${file.name}`;
+
+        // Add AWS-required form fields
+        formData.append('key', fileKey);
+        formData.append('x-amz-algorithm', uploadFields['x-amz-algorithm']);
+        formData.append('x-amz-credential', uploadFields['x-amz-credential']);
+        formData.append('x-amz-date', uploadFields['x-amz-date']);
+        formData.append('x-amz-security-token', uploadFields['x-amz-security-token']);
+        formData.append('policy', uploadFields['policy']);
+        formData.append('x-amz-signature', uploadFields['x-amz-signature']);
+        formData.append('file', file);
+
+        const uploadResponse = await fetch(uploadUrl, {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!uploadResponse.ok && uploadResponse.status !== 204) {
+          throw new Error(`Failed to upload ${file.name}`);
+        }
+      }
+
+      setUploadProgress('Upload complete! Processing files...');
+      
+      // Step 3: Trigger backend processing
+      await fetch('https://gzgrswe52e.execute-api.ap-south-1.amazonaws.com/dev/trigger-converter-files-to-png', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          request_id: caseData.requestId,
+          case_id: caseData.id,
+          additional_data: '',
+        }),
+      });
+
+      alert('Files uploaded successfully! They will be processed shortly.');
+      setShowUploadModal(false);
+      setUploadingFiles([]);
+    } catch (err) {
+      console.error('Upload failed:', err);
+      alert(`Upload failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setIsUploading(false);
+      setUploadProgress('');
+    }
+  };
+
+  // Check if reports are still processing
+  const isProcessing = caseData.reportStatus === 'processing' || caseData.reportStatus === 'anonymizing';
+
+  return (
+    <div className="w-full flex flex-col gap-4">
+      {/* Verification Banner */}
+      {caseData.reportStatus === 'unverified' && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 flex items-center gap-3 shadow-sm">
+          <AlertTriangle className="w-5 h-5 text-yellow-600 flex-shrink-0" />
+          <p className="text-sm text-yellow-800 flex-1">
+            Please verify this case. These reports were anonymized automatically.
+          </p>
+          <button
+            onClick={handleVerifyReports}
+            disabled={isVerifying}
+            className="px-4 py-2 bg-yellow-600 text-white text-sm font-medium rounded-md hover:bg-yellow-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+          >
+            {isVerifying ? 'Verifying...' : 'Verify'}
+          </button>
+        </div>
+      )}
+
+      {/* Processing Message */}
+      {isProcessing && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-6 text-center">
+          <Loader2 className="w-8 h-8 text-blue-600 mx-auto mb-3 animate-spin" />
+          <p className="text-sm text-blue-800 font-medium">
+            Reports are still anonymizing. Please wait. They will be available shortly.
+          </p>
+        </div>
+      )}
+
+      {/* Error Message */}
+      {error && !isProcessing && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-center">
+          <AlertTriangle className="w-6 h-6 text-red-600 mx-auto mb-2" />
+          <p className="text-sm text-red-800">{error}</p>
+        </div>
+      )}
+
+      {/* Loading State */}
+      {loading && !isProcessing && (
+        <div className="bg-white rounded-lg shadow p-12 text-center">
+          <Loader2 className="w-8 h-8 text-blue-600 mx-auto mb-3 animate-spin" />
+          <p className="text-sm text-gray-600">Loading reports...</p>
+        </div>
+      )}
+
+      {/* Two-Panel Layout */}
+      {!isProcessing && !loading && !error && (
+        <div className="grid grid-cols-4 gap-6 h-[calc(100vh-12rem)]">
+          {/* Left Panel - Reports List */}
+          <div className="col-span-1 bg-white rounded-lg shadow overflow-hidden flex flex-col h-full">
+            <div className="p-6 border-b border-gray-200 flex items-center justify-between">
+              <h3 className="text-lg font-medium text-gray-900">Reports</h3>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="p-1.5 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors"
+                title="Upload more files"
+              >
+                <Upload className="w-4 h-4" />
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={handleFileSelect}
+                accept="*"
+              />
+            </div>
+
+            {/* Reports List */}
+            <div className="flex-1 overflow-y-auto">
+              {reports.length > 0 ? (
+                <div className="divide-y divide-gray-200">
+                  {reports.map((report, index) => (
+                    <div
+                      key={index}
+                      className={`p-4 border-l-4 transition-colors relative ${
+                        selectedReport?.filename === report.filename
+                          ? 'border-l-blue-600 bg-blue-50'
+                          : 'border-l-gray-200 hover:bg-gray-50'
+                      }`}
+                    >
+                      <div className="flex items-start gap-3">
+                        <FileText className="w-5 h-5 text-blue-500 flex-shrink-0 mt-0.5" />
+                        <div 
+                          className="flex-1 min-w-0 cursor-pointer"
+                          onClick={() => setSelectedReport(report)}
+                        >
+                          <p className="text-sm font-medium text-gray-900 truncate">
+                            {report.filename}
+                          </p>
+                        </div>
+                        <div className="relative" ref={openMenuIndex === index ? menuRef : null}>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setOpenMenuIndex(openMenuIndex === index ? null : index);
+                            }}
+                            className="p-1 hover:bg-gray-200 rounded transition-colors"
+                          >
+                            <MoreVertical className="w-4 h-4 text-gray-600" />
+                          </button>
+                          {openMenuIndex === index && (
+                            <div className="absolute right-0 mt-1 w-40 bg-white rounded-md shadow-lg border border-gray-200 z-10">
+                              <div className="py-1">
+                                {/* <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleEditReport(report);
+                                  }}
+                                  className="w-full flex items-center gap-2 px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors"
+                                >
+                                  <Edit2 className="w-4 h-4" />
+                                  <span>Edit</span>
+                                </button> */}
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteReport(report);
+                                  }}
+                                  className="w-full flex items-center gap-2 px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                  <span>Delete</span>
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="p-6 text-center">
+                  <FileText className="w-12 h-12 text-gray-300 mx-auto mb-3" />
+                  <p className="text-sm text-gray-500">No reports available for this case.</p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Right Panel - Report Viewer */}
+          <div className="col-span-3 bg-white rounded-lg shadow overflow-hidden flex flex-col h-full">
+            {selectedReport ? (
+              <iframe
+                src={selectedReport.url}
+                className="w-full h-full"
+                title={selectedReport.filename}
+              />
+            ) : (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center">
+                  <FileText className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                  <p className="text-lg text-gray-600 font-medium">
+                    Select a report to view
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Upload Files Modal */}
+      {showUploadModal && (
+        <Modal
+          isOpen={showUploadModal}
+          onClose={() => !isUploading && setShowUploadModal(false)}
+          title="Upload Additional Files"
+        >
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <h4 className="text-sm font-medium text-gray-900">Selected Files ({uploadingFiles.length})</h4>
+              <ul className="text-sm text-gray-700 space-y-1">
+                {uploadingFiles.map((file, idx) => (
+                  <li key={idx} className="flex items-center gap-2">
+                    <FileText className="w-4 h-4 text-gray-400" />
+                    <span>{file.name}</span>
+                    <span className="text-gray-500">({(file.size / (1024 * 1024)).toFixed(2)} MB)</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {uploadProgress && (
+              <div className="bg-gray-50 border border-gray-200 rounded-md p-3">
+                <p className="text-sm text-gray-700">{uploadProgress}</p>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-3 mt-6">
+              <button
+                onClick={() => setShowUploadModal(false)}
+                disabled={isUploading}
+                className="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50 transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleUploadFiles}
+                disabled={isUploading}
+                className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors disabled:opacity-50 flex items-center gap-2"
+              >
+                {isUploading ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Uploading...</span>
+                  </>
+                ) : (
+                  <>
+                    <Upload className="w-4 h-4" />
+                    <span>Upload Files</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
