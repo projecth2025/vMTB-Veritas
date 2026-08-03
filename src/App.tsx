@@ -6,6 +6,7 @@ import { CasesProvider } from './context/CasesContext';
 import { CaseCreationProvider } from './context/CaseCreationContext';
 import { Login } from './pages/Login';
 import { Signup } from './pages/Signup';
+import { AuthCallback } from './pages/AuthCallback';
 import { ForgotPassword } from './pages/ForgotPassword';
 import { ResetPassword } from './pages/ResetPassword';
 import { MyCases } from './pages/MyCases';
@@ -66,17 +67,18 @@ function AuthRecoveryHandler() {
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, loading } = useAuth();
+  const location = useLocation();
   
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-gray-600">Loading...</div>
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <div className="text-gray-600 font-medium animate-pulse">Loading...</div>
       </div>
     );
   }
   
   if (!isAuthenticated) {
-    return <Navigate to="/login" />;
+    return <Navigate to="/login" replace state={{ from: location }} />;
   }
   
   return <>{children}</>;
@@ -98,6 +100,7 @@ function App() {
             <Routes>
               <Route path="/login" element={<Login />} />
               <Route path="/signup" element={<Signup />} />
+              <Route path="/auth/callback" element={<AuthCallback />} />
               <Route path="/forgot-password" element={<ForgotPassword />} />
               <Route path="/reset-password" element={<ResetPassword />} />
 

@@ -10,6 +10,7 @@ interface AuthContextType {
   loginWithPhone: (countryCode: string, phoneNumber: string, password: string) => Promise<void>;
   sendPhoneOtp: (countryCode: string, phoneNumber: string) => Promise<void>;
   verifyPhoneOtp: (countryCode: string, phoneNumber: string, otpCode: string) => Promise<void>;
+  signInWithGoogle: (flow?: 'login' | 'signup') => Promise<void>;
   signup: (params: {
     name: string;
     email: string;
@@ -193,30 +194,55 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const loginWithPhone = async (countryCode: string, phoneNumber: string, password: string) => {
-    // Construct E.164 format phone number (with +)
     const cleanCountryCode = countryCode.replace(/\D/g, '');
     const cleanPhoneNumber = phoneNumber.replace(/\D/g, '');
-    const phoneE164 = `+${cleanCountryCode}${cleanPhoneNumber}`;
+    const fullPhone = `${cleanCountryCode}${cleanPhoneNumber}`;
     
-    // Debug logging - remove after fixing
-    console.log('[DEBUG] Phone login payload:', {
-      phone: phoneE164,
-      passwordLength: password.length,
-      rawCountryCode: countryCode,
-      rawPhoneNumber: phoneNumber
-    });
+    console.log('[AUTH] Logging in with phone:', fullPhone);
     
-    const { error, data } = await supabase.auth.signInWithPassword({ 
-      phone: phoneE164, 
-      password 
+    // Step 1: Look up account profile by whatsapp_number (selecting ONLY existing 'id' column)
+    const { data: profiles, error: profileErr } = await supabase
+      .from('profiles')
+      .select('id')
+      .or(`whatsapp_number.eq.${fullPhone},whatsapp_number.eq.${cleanPhoneNumber}`);
+
+    if (profileErr || !profiles || profiles.length === 0) {
+      console.error('[AUTH] Profile lookup failed:', profileErr);
+      throw new Error('Invalid credentials');
+    }
+
+    const userId = profiles[0].id;
+
+    // Step 2: Retrieve user's primary email from Supabase Auth via Edge Function
+    const { data: edgeData, error: edgeErr } = await supabase.functions.invoke('verify_whatsapp_otp', {
+      body: { action: 'get_email', user_id: userId, phone: fullPhone, otp: '000000' }
     });
-    if (error) throw error;
+
+    if (edgeErr || !edgeData?.email) {
+      console.error('[AUTH] Failed to fetch email from Auth:', edgeErr);
+      throw new Error('Invalid credentials');
+    }
+
+    const userEmail = edgeData.email;
+
+    // Step 3: Authenticate with Supabase Auth using email & entered password
+    const { error, data } = await supabase.auth.signInWithPassword({
+      email: userEmail,
+      password: password,
+    });
+
+    if (error) {
+      if (error.message.includes('Invalid login credentials')) {
+        throw new Error('Invalid credentials');
+      }
+      throw error;
+    }
+
     const u = data.user;
     if (u) {
       const userData = { id: u.id, email: u.email ?? null, name: (u as any)?.user_metadata?.name };
       setUser(userData);
       storeUser(userData);
-      // Fire-and-forget profile name fetch to avoid blocking UI
       loadProfileName(u.id);
     }
   };
@@ -259,6 +285,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const signInWithGoogle = async (flow: 'login' | 'signup' = 'login') => {
+    const redirectUrl = `${window.location.origin}/auth/callback${flow === 'signup' ? '?flow=signup' : ''}`;
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: redirectUrl,
+      },
+    });
+    if (error) throw error;
+  };
+
   const signup = async ({ name, email, password, profession, hospital, whatsappNumber }: {
     name: string; email: string; password: string; profession?: string; hospital?: string; whatsappNumber?: string;
   }) => {
@@ -294,13 +331,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const logout = async () => {
-    const { error } = await supabase.auth.signOut();
-    if (error) throw error;
-    setUser(null);
-    storeUser(null);
+    try {
+      await supabase.auth.signOut();
+    } catch (err) {
+      console.error('[AUTH] Error during supabase.auth.signOut():', err);
+    } finally {
+      setUser(null);
+      storeUser(null);
+      setIsInPasswordRecovery(false);
+      if (canUseStorage()) {
+        window.localStorage.removeItem(AUTH_USER_STORAGE_KEY);
+        for (let i = window.localStorage.length - 1; i >= 0; i--) {
+          const key = window.localStorage.key(i);
+          if (key && (key.startsWith('sb-') || key.includes('supabase') || key.includes('vmtb'))) {
+            window.localStorage.removeItem(key);
+          }
+        }
+      }
+    }
   };
 
-  const value = useMemo(() => ({ isAuthenticated, user, loading, isInPasswordRecovery, login, loginWithPhone, sendPhoneOtp, verifyPhoneOtp, signup, requestPasswordReset, logout }), [isAuthenticated, user, loading, isInPasswordRecovery]);
+  const value = useMemo(() => ({ isAuthenticated, user, loading, isInPasswordRecovery, login, loginWithPhone, sendPhoneOtp, verifyPhoneOtp, signInWithGoogle, signup, requestPasswordReset, logout }), [isAuthenticated, user, loading, isInPasswordRecovery]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

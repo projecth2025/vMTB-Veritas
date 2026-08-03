@@ -31,10 +31,10 @@ export function MobileNav({ onProfileClick, onFeedbackClick }: MobileNavProps) {
     };
   }, [isMenuOpen]);
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     setIsMenuOpen(false);
-    logout();
-    navigate('/login');
+    await logout();
+    navigate('/login', { replace: true });
   };
 
   const isActive = (path: string) => location.pathname === path;

@@ -1,28 +1,59 @@
 import { useState, useEffect, useRef } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import { useNavigate, Link, useLocation } from 'react-router-dom';
 import { supabase } from '../Supabase/client';
 import { showToast } from '../utils/toast';
-import { sendWhatsAppOTP, verifyWhatsAppOTPAndCreateUser } from '../services/whatsappOtp';
+import { sendWhatsAppOTP, verifyWhatsAppOTPForExistingUser, isPhoneNumberRegistered } from '../services/whatsappOtp';
+import { useAuth } from '../context/AuthContext';
+import { PasswordInput } from '../components/PasswordInput';
+import { validatePasswordRules } from '../components/PasswordStrength';
 
-type SignupStep = 'form' | 'otp';
+type SignupStep = 'google-gate' | 'form' | 'otp';
+
+interface GoogleState {
+  googleEmail: string;
+  googleUserId: string;
+  googleName: string;
+  googleAuthenticated: boolean;
+}
 
 export function Signup() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { signInWithGoogle } = useAuth();
+
+  // Check if we arrived here with Google auth data from AuthCallback
+  const googleState = location.state as GoogleState | null;
+
   const [name, setName] = useState('');
-  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [profession, setProfession] = useState('');
   const [hospital, setHospital] = useState('');
+  const [countryCode, setCountryCode] = useState('91');
   const [phoneNumber, setPhoneNumber] = useState('');
-  const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  
+
+  // Google auth data (from OAuth callback)
+  const [googleEmail, setGoogleEmail] = useState('');
+  const [googleUserId, setGoogleUserId] = useState('');
+
   // OTP verification state
-  const [step, setStep] = useState<SignupStep>('form');
+  const [step, setStep] = useState<SignupStep>('google-gate');
   const [otp, setOtp] = useState(['', '', '', '', '', '']);
   const [resendCooldown, setResendCooldown] = useState(0);
   const otpInputsRef = useRef<(HTMLInputElement | null)[]>([]);
+
+  // Initialize from Google state if available
+  useEffect(() => {
+    if (googleState?.googleAuthenticated && googleState?.googleEmail) {
+      setGoogleEmail(googleState.googleEmail);
+      setGoogleUserId(googleState.googleUserId);
+      setName(googleState.googleName || '');
+      setStep('form');
+    }
+  }, [googleState]);
 
   // Handle resend cooldown timer
   useEffect(() => {
@@ -39,17 +70,29 @@ export function Signup() {
     }
   }, [step]);
 
+  const handleGoogleAuth = async () => {
+    setError(null);
+    setGoogleLoading(true);
+    try {
+      await signInWithGoogle('signup');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Google authentication failed';
+      setError(message);
+      setGoogleLoading(false);
+    }
+  };
+
+  const getFullPhone = () => {
+    const cleanCode = countryCode.replace(/\D/g, '');
+    const cleanNum = phoneNumber.replace(/\D/g, '');
+    return `${cleanCode}${cleanNum}`;
+  };
+
   const handleSendOTP = async (e: React.FormEvent) => {
     e.preventDefault();
     
-    // Validate all required fields
     if (!name.trim()) {
       showToast.error('Full name is required');
-      return;
-    }
-    
-    if (!email.trim()) {
-      showToast.error('Email is required');
       return;
     }
     
@@ -63,25 +106,23 @@ export function Signup() {
       return;
     }
     
-    if (!phoneNumber.trim()) {
-      showToast.error('Phone number is required');
+    const cleanNum = phoneNumber.replace(/\D/g, '');
+    if (!cleanNum || cleanNum.length < 7 || cleanNum.length > 15) {
+      showToast.error('Please enter a valid phone number');
       return;
     }
     
-    // Validate phone number is digits only and reasonable length
-    const cleanPhone = phoneNumber.replace(/\D/g, '');
-    if (cleanPhone.length < 10 || cleanPhone.length > 15) {
-      showToast.error('Please enter a valid phone number (10-15 digits)');
+    const passRules = validatePasswordRules(password);
+    if (!passRules.isValid) {
+      const msg = 'Password must be at least 8 characters long, contain a number, and contain an uppercase letter.';
+      showToast.error(msg);
+      setError(msg);
       return;
     }
-    
+
     if (password !== confirmPassword) {
       showToast.error('Passwords do not match');
-      return;
-    }
-    
-    if (password.length < 6) {
-      showToast.error('Password must be at least 6 characters');
+      setError('Passwords do not match');
       return;
     }
 
@@ -89,11 +130,19 @@ export function Signup() {
     setLoading(true);
     
     try {
-      // User enters number including country code; normalize to E.164 shape.
-      const cleanPhoneNum = phoneNumber.replace(/\D/g, '');
-      const formattedPhone = `+${cleanPhoneNum}`;
-      
-      const result = await sendWhatsAppOTP(formattedPhone);
+      const fullPhone = getFullPhone();
+
+      // Check if phone number is already registered to another account
+      const checkRes = await isPhoneNumberRegistered(fullPhone, googleUserId || undefined);
+      if (checkRes.registered) {
+        const errorMsg = 'An account with this phone number already exists. Please log in instead or use a different phone number.';
+        setError(errorMsg);
+        showToast.error(errorMsg);
+        setLoading(false);
+        return;
+      }
+
+      const result = await sendWhatsAppOTP(fullPhone);
       
       if (!result.success) {
         setError(result.error || 'Failed to send OTP');
@@ -102,7 +151,7 @@ export function Signup() {
       
       showToast.success('OTP sent to your WhatsApp');
       setStep('otp');
-      setResendCooldown(60); // 60 seconds cooldown for resend
+      setResendCooldown(60);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to send OTP';
       setError(message);
@@ -116,10 +165,8 @@ export function Signup() {
     
     setLoading(true);
     try {
-      const cleanPhoneNum = phoneNumber.replace(/\D/g, '');
-      const formattedPhone = `+${cleanPhoneNum}`;
-      
-      const result = await sendWhatsAppOTP(formattedPhone);
+      const fullPhone = getFullPhone();
+      const result = await sendWhatsAppOTP(fullPhone);
       
       if (!result.success) {
         showToast.error(result.error || 'Failed to resend OTP');
@@ -139,13 +186,12 @@ export function Signup() {
   };
 
   const handleOtpChange = (index: number, value: string) => {
-    if (!/^\d*$/.test(value)) return; // Only allow digits
+    if (!/^\d*$/.test(value)) return;
     
     const newOtp = [...otp];
-    newOtp[index] = value.slice(-1); // Only take last character
+    newOtp[index] = value.slice(-1);
     setOtp(newOtp);
     
-    // Auto-focus next input
     if (value && index < 5) {
       otpInputsRef.current[index + 1]?.focus();
     }
@@ -166,7 +212,6 @@ export function Signup() {
         newOtp[i] = pastedData[i];
       }
       setOtp(newOtp);
-      // Focus the input after the last pasted digit
       const focusIndex = Math.min(pastedData.length, 5);
       otpInputsRef.current[focusIndex]?.focus();
     }
@@ -185,41 +230,41 @@ export function Signup() {
     setLoading(true);
     
     try {
-      // Construct phone numbers in both formats
-      const cleanPhoneNum = phoneNumber.replace(/\D/g, '');
-      const phoneForProfile = cleanPhoneNum; // Without + for profiles
-      const phoneForAuth = `+${cleanPhoneNum}`; // With + for auth (E.164)
+      const fullPhone = getFullPhone();
+      const phoneE164 = `+${fullPhone}`;
       
-      const result = await verifyWhatsAppOTPAndCreateUser({
-        phone: phoneForProfile, // For OTP verification and profiles table
-        phoneE164: phoneForAuth, // For auth.users.phone (E.164 format)
+      // Step 1: Verify OTP and update auth user (password + confirmed phone) & profile via Edge Function
+      const result = await verifyWhatsAppOTPForExistingUser({
+        phone: fullPhone,
         otp: otpString,
-        email,
-        password,
-        full_name: name,
-        profession: profession || undefined,
-        hospital: hospital || undefined,
+        userId: googleUserId,
+        password: password,
+        phoneE164: phoneE164,
+        fullName: name,
+        profession: profession,
+        hospital: hospital,
       });
       
       if (!result.success) {
         setError(result.error || 'Failed to verify OTP');
         return;
       }
+
+      // Step 2: Also update local profile state directly for fast availability
+      await supabase.from('profiles').upsert({
+        id: googleUserId,
+        full_name: name,
+        profession: profession || null,
+        hospital: hospital || null,
+        whatsapp_number: fullPhone,
+        whatsapp_verified: true,
+        whatsapp_opt_in: true,
+      }, { onConflict: 'id' });
       
-      showToast.success('Account created successfully! Please login.');
+      showToast.success('Account created successfully!');
       
-      // Sign in the user automatically after successful registration
-      const { error: signInError } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
-      
-      if (signInError) {
-        // If auto-login fails, redirect to login page
-        navigate('/login');
-      } else {
-        navigate('/my-cases');
-      }
+      // Step 3: User is already authenticated via Google OAuth — navigate directly to /my-cases
+      navigate('/my-cases', { replace: true });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to create account';
       setError(message);
@@ -236,7 +281,7 @@ export function Signup() {
 
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center px-4 py-8">
-      <div className="w-full max-w-3xl">
+      <div className={`w-full ${step === 'form' ? 'max-w-3xl' : 'max-w-md'}`}>
         <div className="bg-white rounded-2xl shadow-sm p-8">
           {/* Header */}
           <div className="flex items-center justify-center space-x-3 mb-8">
@@ -244,7 +289,8 @@ export function Signup() {
             <h1 className="text-3xl font-bold text-gray-900">vMTB</h1>
           </div>
 
-          {step === 'form' ? (
+          {/* Step 1: Google Gate */}
+          {step === 'google-gate' && (
             <>
               <h2 className="text-2xl font-semibold text-gray-900 mb-2 text-center">
                 Create your account
@@ -253,8 +299,67 @@ export function Signup() {
                 Join our community of healthcare professionals
               </p>
 
+              <div className="space-y-6">
+                <p className="text-center text-sm" style={{ color: '#4A5565' }}>
+                  To get started, verify your email through Google
+                </p>
+
+                {error && (
+                  <div className="text-sm text-red-600 bg-red-50 p-3 rounded-lg">
+                    {error}
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleGoogleAuth}
+                  disabled={googleLoading}
+                  className="w-full flex items-center justify-center gap-3 px-4 py-2.5 border border-gray-300 rounded-lg font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {googleLoading ? (
+                    <div
+                      className="w-5 h-5 border-2 border-gray-300 rounded-full animate-spin"
+                      style={{ borderTopColor: '#4A90E2' }}
+                    />
+                  ) : (
+                    <svg className="w-5 h-5" viewBox="0 0 24 24">
+                      <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4" />
+                      <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853" />
+                      <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05" />
+                      <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" />
+                    </svg>
+                  )}
+                  {googleLoading ? 'Connecting...' : 'Continue with Google'}
+                </button>
+              </div>
+
+              <div className="mt-8 text-center" style={{ color: '#4A5565' }}>
+                <span className="text-sm">
+                  Already have an account?{' '}
+                  <Link to="/login" className="font-semibold transition" style={{ color: '#4A90E2' }}>
+                    Login here
+                  </Link>
+                </span>
+              </div>
+            </>
+          )}
+
+          {/* Step 2: Signup Form */}
+          {step === 'form' && (
+            <>
+              <h2 className="text-2xl font-semibold text-gray-900 mb-2 text-center">
+                Create your account
+              </h2>
+              <p className="text-center text-gray-600 mb-2">
+                Join our community of healthcare professionals
+              </p>
+              {googleEmail && (
+                <p className="text-center text-sm mb-8" style={{ color: '#4A5565' }}>
+                  Signing up as <span className="font-semibold text-gray-900">{googleEmail}</span>
+                </p>
+              )}
+
               <form onSubmit={handleSendOTP}>
-                {/* Two-column grid for desktop, single column for mobile */}
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
                   {/* Left Column */}
                   <div className="space-y-5">
@@ -270,22 +375,6 @@ export function Signup() {
                         className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-offset-0 transition text-sm"
                         style={{ '--tw-ring-color': '#4A90E2' } as React.CSSProperties}
                         placeholder="Dr. John Doe"
-                        required
-                      />
-                    </div>
-
-                    <div>
-                      <label htmlFor="email" className="block text-sm font-medium text-gray-900 mb-2">
-                        Email Address
-                      </label>
-                      <input
-                        id="email"
-                        type="email"
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-offset-0 transition text-sm"
-                        style={{ '--tw-ring-color': '#4A90E2' } as React.CSSProperties}
-                        placeholder="doctor@hospital.com"
                         required
                       />
                     </div>
@@ -354,35 +443,45 @@ export function Signup() {
                       <label htmlFor="whatsapp" className="block text-sm font-medium text-gray-900 mb-2">
                         Phone Number
                       </label>
-                      <input
-                        id="whatsapp"
-                        type="tel"
-                        inputMode="numeric"
-                        value={phoneNumber}
-                        onChange={(e) => setPhoneNumber(e.target.value.replace(/\D/g, ''))}
-                        className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-offset-0 transition text-sm"
-                        style={{ '--tw-ring-color': '#4A90E2' } as React.CSSProperties}
-                        placeholder="919876543210"
-                        required
-                      />
-                      <p className="text-xs mt-1.5" style={{ color: '#4A5565' }}>
-                        Please include your country code (e.g., 91XXXXXXXXXX for India)
-                      </p>
+                      <div className="flex gap-2">
+                        <div className="relative">
+                          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 text-sm">+</span>
+                          <input
+                            id="signup-country-code"
+                            type="text"
+                            inputMode="numeric"
+                            value={countryCode}
+                            onChange={(e) => setCountryCode(e.target.value.replace(/\D/g, ''))}
+                            className="w-20 pl-7 pr-2 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-offset-0 transition text-sm"
+                            style={{ '--tw-ring-color': '#4A90E2' } as React.CSSProperties}
+                            placeholder="91"
+                          />
+                        </div>
+                        <input
+                          id="whatsapp"
+                          type="tel"
+                          inputMode="numeric"
+                          value={phoneNumber}
+                          onChange={(e) => setPhoneNumber(e.target.value.replace(/\D/g, ''))}
+                          className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-offset-0 transition text-sm"
+                          style={{ '--tw-ring-color': '#4A90E2' } as React.CSSProperties}
+                          placeholder="9876543210"
+                          required
+                        />
+                      </div>
                     </div>
 
                     <div>
                       <label htmlFor="password" className="block text-sm font-medium text-gray-900 mb-2">
                         Password
                       </label>
-                      <input
+                      <PasswordInput
                         id="password"
-                        type="password"
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
-                        className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-offset-0 transition text-sm"
-                        style={{ '--tw-ring-color': '#4A90E2' } as React.CSSProperties}
-                        placeholder="Min. 6 characters"
+                        placeholder="Min. 8 chars, 1 number, 1 uppercase"
                         required
+                        showStrength={true}
                       />
                     </div>
 
@@ -390,13 +489,10 @@ export function Signup() {
                       <label htmlFor="confirmPassword" className="block text-sm font-medium text-gray-900 mb-2">
                         Confirm Password
                       </label>
-                      <input
+                      <PasswordInput
                         id="confirmPassword"
-                        type="password"
                         value={confirmPassword}
                         onChange={(e) => setConfirmPassword(e.target.value)}
-                        className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-offset-0 transition text-sm"
-                        style={{ '--tw-ring-color': '#4A90E2' } as React.CSSProperties}
                         placeholder="Re-enter password"
                         required
                       />
@@ -404,7 +500,6 @@ export function Signup() {
                   </div>
                 </div>
 
-                {/* Error and Submit - Full Width */}
                 {error && (
                   <div className="text-sm text-red-600 bg-red-50 p-3 rounded-lg mb-6">
                     {error}
@@ -432,7 +527,10 @@ export function Signup() {
                 </span>
               </div>
             </>
-          ) : (
+          )}
+
+          {/* Step 3: OTP Verification */}
+          {step === 'otp' && (
             <>
               <div className="text-center mb-8">
                 <h2 className="text-2xl font-semibold text-gray-900 mb-2">
@@ -440,7 +538,7 @@ export function Signup() {
                 </h2>
                 <p style={{ color: '#4A5565' }} className="text-sm">
                   We've sent a 6-digit OTP to your WhatsApp<br />
-                  <span className="font-semibold text-gray-900">+{phoneNumber.replace(/\D/g, '')}</span>
+                  <span className="font-semibold text-gray-900">+{getFullPhone()}</span>
                 </p>
               </div>
 

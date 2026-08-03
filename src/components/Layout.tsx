@@ -147,9 +147,9 @@ export function Layout({ children, wide = false }: LayoutProps) {
     }
   };
 
-  const handleLogout = () => {
-    logout();
-    navigate('/login');
+  const handleLogout = async () => {
+    await logout();
+    navigate('/login', { replace: true });
   };
 
   const isActive = (path: string) => location.pathname === path;
