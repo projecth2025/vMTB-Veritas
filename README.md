@@ -4,9 +4,9 @@
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
-### 🛡️ Authentication & Security
+### Authentication & Security
 - **Multi-Factor & Flexible Authentication**:
   - **Continue with Google** (OAuth 2.0)
   - **Phone Number + Password**
@@ -27,7 +27,7 @@
 
 ---
 
-### 📋 Patient Case Management
+### Patient Case Management
 - **Multi-Step Case Creation Workflow**:
   - Step 1: Patient demographics, clinical diagnosis, cancer stage, and medical history.
   - Step 2: Genomic profiling uploads, biomarker reporting, and diagnostic file attachments.
@@ -39,7 +39,7 @@
 
 ---
 
-### 👥 Virtual Molecular Tumor Board (MTB) Meetings
+### Virtual Molecular Tumor Board (MTB) Meetings
 - **MTB Dashboards & Scheduling**:
   - View scheduled MTB sessions, participant lists, and assigned cases.
 - **Multidisciplinary Collaboration**:
@@ -53,7 +53,7 @@
 
 ---
 
-## 🚀 Tech Stack
+## Tech Stack
 
 - **Frontend Core**: [React 18](https://react.dev/), [TypeScript](https://www.typescriptlang.org/), [Vite](https://vitejs.dev/)
 - **Styling & UI**: [Tailwind CSS](https://tailwindcss.com/), [Lucide React Icons](https://lucide.dev/), [React Hot Toast](https://react-hot-toast.com/)
@@ -64,7 +64,7 @@
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
 VMTB-Veritas/
@@ -88,7 +88,7 @@ VMTB-Veritas/
 
 ---
 
-## 🛠️ Getting Started
+## Getting Started
 
 ### Prerequisites
 - **Node.js**: `v18.0.0` or higher
@@ -133,7 +133,7 @@ VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
 
 ---
 
-## 🔒 Security & Privacy
+## Security & Privacy
 
 - All user data and clinical files are transmitted over HTTPS and authenticated using Supabase JWT tokens.
 - Protected routes strictly validate user session tokens before granting access to patient records or MTB meetings.
@@ -141,6 +141,6 @@ VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
 
 ---
 
-## 📄 License
+## License
 
 Private & Confidential — vMTB Veritas Platform.
