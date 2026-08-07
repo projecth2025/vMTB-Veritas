@@ -1,16 +1,48 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Layout } from '../components/Layout';
 import { useCaseCreation } from '../context/CaseCreationContext';
 import { useIsMobile } from '../hooks/useMobile';
 import { AlertCircle, FileText } from 'lucide-react';
+import { VoiceRecorder } from '../components/VoiceRecorder';
 
 export default function NewCaseStep2() {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
   const { step1Data, caseExplanation, setCaseExplanation } = useCaseCreation();
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   
   const [explanation, setExplanation] = useState(caseExplanation || '');
+
+  // Auto-resize logic: maintains min height, expands as explanation grows up to ~20 lines, then scrolls
+  const adjustTextareaHeight = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = 'auto';
+    const lineHeight = 24; // ~24px per line
+    const minHeight = isMobile ? 300 : 400;
+    const maxHeight = Math.max(minHeight, 20 * lineHeight + 24); // ~20 lines max (~504px)
+
+    const scrollHeight = textarea.scrollHeight;
+    const targetHeight = Math.min(Math.max(scrollHeight, minHeight), maxHeight);
+
+    textarea.style.height = `${targetHeight}px`;
+    textarea.style.overflowY = scrollHeight > maxHeight ? 'auto' : 'hidden';
+  }, [isMobile]);
+
+  useEffect(() => {
+    adjustTextareaHeight();
+  }, [explanation, adjustTextareaHeight]);
+
+  const handleVoiceTranscription = (text: string) => {
+    console.log(`[NewCaseStep2] handleVoiceTranscription called with text length: ${text.length}`);
+    setExplanation((prev) => {
+      const next = prev ? prev + '\n\n' + text : text;
+      console.log(`[NewCaseStep2] Updated explanation state length: ${next.length}`);
+      return next;
+    });
+  };
 
   // Redirect if no step1Data
   if (!step1Data) {
@@ -20,14 +52,11 @@ export default function NewCaseStep2() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-
-    // Save to context
     setCaseExplanation(explanation);
     navigate('/cases/review');
   };
 
   const handleBack = () => {
-    // Save current explanation before going back
     setCaseExplanation(explanation);
     navigate('/cases/new/step-1');
   };
@@ -63,6 +92,12 @@ export default function NewCaseStep2() {
                 <label htmlFor="explanation" className="text-sm font-medium" style={{ color: '#4A5565' }}>
                   Case Explanation
                 </label>
+                <VoiceRecorder
+                  onTranscriptionComplete={handleVoiceTranscription}
+                  variant="explanation"
+                  source="step2"
+                  iconSize={18}
+                />
               </div>
               <p className="text-xs text-gray-500">
                 {explanation.length} characters
@@ -70,10 +105,11 @@ export default function NewCaseStep2() {
             </div>
 
             <textarea
+              ref={textareaRef}
               id="explanation"
               value={explanation}
               onChange={(e) => setExplanation(e.target.value)}
-              className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 resize-none"
+              className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 resize-none transition-all duration-150"
               style={{ 
                 '--tw-ring-color': '#4A90E2',
                 minHeight: isMobile ? '300px' : '400px',

@@ -12,6 +12,7 @@ import { VerifyModal } from '../components/VerifyModal';
 import { OpinionComment } from '../components/OpinionComment';
 import { InlineOpinionInput } from '../components/InlineOpinionInput';
 import { TreatmentPlanFollowUp } from '../components/TreatmentPlanFollowUp';
+import { VoiceRecorder } from '../components/VoiceRecorder';
 import { useCases, Case, Opinion, Question } from '../context/CasesContext';
 import { useAuth } from '../context/AuthContext';
 import { supabase } from '../Supabase/client';
@@ -54,6 +55,21 @@ export function ViewCase() {
   const [showAddQuestionModal, setShowAddQuestionModal] = useState(false);
   const [newQuestionText, setNewQuestionText] = useState('');
   const [addingQuestion, setAddingQuestion] = useState(false);
+  const questionTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Auto-resize for Add Question textarea up to ~20 lines
+  useEffect(() => {
+    const textarea = questionTextareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = 'auto';
+    const lineHeight = 22;
+    const minHeight = 4 * lineHeight + 16;
+    const maxHeight = 20 * lineHeight + 16;
+    const scrollHeight = textarea.scrollHeight;
+    const targetHeight = Math.min(Math.max(scrollHeight, minHeight), maxHeight);
+    textarea.style.height = `${targetHeight}px`;
+    textarea.style.overflowY = scrollHeight > maxHeight ? 'auto' : 'hidden';
+  }, [newQuestionText]);
   const [opinionMtbs, setOpinionMtbs] = useState<Array<{ id: string; name: string }>>([]);
   const [selectedOpinionMtbId, setSelectedOpinionMtbId] = useState<string | null>(null);
   const [opinionsLoading, setOpinionsLoading] = useState(false);
@@ -795,6 +811,7 @@ export function ViewCase() {
                       onSubmit={handleSubmitGeneralOpinion}
                       placeholder="Write your opinion..."
                       variant="card"
+                      source="general_opinion"
                     />
                   )}
 
@@ -929,6 +946,7 @@ export function ViewCase() {
                                   placeholder="Write your answer..."
                                   variant="inline"
                                   submitLabel="Answer"
+                                  source="answer"
                                 />
                               )}
                             </div>
@@ -1110,14 +1128,24 @@ export function ViewCase() {
         title="Add New Question"
       >
         <div className="space-y-4">
-          <textarea
-            value={newQuestionText}
-            onChange={(e) => setNewQuestionText(e.target.value)}
-            rows={4}
-            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-            placeholder="Enter your question for the experts..."
-            autoFocus
-          />
+          <div className="relative">
+            <textarea
+              ref={questionTextareaRef}
+              value={newQuestionText}
+              onChange={(e) => setNewQuestionText(e.target.value)}
+              rows={4}
+              className="w-full px-3 py-2 pr-10 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none transition-all duration-150"
+              placeholder="Enter your question for the experts..."
+              autoFocus
+            />
+            <div className="absolute right-3 top-2.5">
+              <VoiceRecorder
+                onTranscriptionComplete={(text) => setNewQuestionText((prev) => (prev ? prev + ' ' + text : text))}
+                variant="inline"
+                source="question"
+              />
+            </div>
+          </div>
 
           <div className="flex justify-end space-x-3">
             <button
