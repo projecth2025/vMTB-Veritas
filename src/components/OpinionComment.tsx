@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { Reply, ThumbsUp } from 'lucide-react';
 import { Opinion } from '../context/CasesContext';
 import { showToast } from '../utils/toast';
+import { VoiceRecorder } from './VoiceRecorder';
 
 function timeAgo(dateStr: string): string {
   const now = Date.now();
@@ -42,11 +43,30 @@ export function OpinionComment({
   const [replyText, setReplyText] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [liked, setLiked] = useState(false);
+  const replyTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const isOwnOpinion = opinion.authorUserId === currentUserId;
   const isCaseOwner = opinion.authorUserId === ownerId;
 
   const authorLabel = isOwnOpinion ? 'You' : isCaseOwner ? 'Case Owner' : `Anonymous ${opinion.authorUserId?.slice(-2) || ''}`;
+
+  // Auto-resize reply textarea up to ~20 lines
+  useEffect(() => {
+    if (!showReplyInput) return;
+    const textarea = replyTextareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = 'auto';
+    const lineHeight = 20; // ~20px per line
+    const minHeight = 2 * lineHeight + 16;
+    const maxHeight = 20 * lineHeight + 16; // ~20 lines limit (~416px)
+
+    const scrollHeight = textarea.scrollHeight;
+    const targetHeight = Math.min(Math.max(scrollHeight, minHeight), maxHeight);
+
+    textarea.style.height = `${targetHeight}px`;
+    textarea.style.overflowY = scrollHeight > maxHeight ? 'auto' : 'hidden';
+  }, [replyText, showReplyInput]);
 
   // Get replies to this opinion
   const replies = allOpinions
@@ -70,6 +90,11 @@ export function OpinionComment({
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const handleTranscriptionComplete = (text: string) => {
+    console.log(`[OpinionComment] handleTranscriptionComplete called for reply with text length: ${text.length}`);
+    setReplyText((prev) => (prev ? prev + ' ' + text : text));
   };
 
   const marginLeft = depth > 0 ? 20 : 0;
@@ -120,14 +145,24 @@ export function OpinionComment({
         {/* Inline Reply Input */}
         {showReplyInput && (
           <div className="mt-3 ml-8 space-y-2">
-            <textarea
-              value={replyText}
-              onChange={(e) => setReplyText(e.target.value)}
-              rows={2}
-              className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none bg-gray-50"
-              placeholder="Write your reply..."
-              autoFocus
-            />
+            <div className="relative">
+              <textarea
+                ref={replyTextareaRef}
+                value={replyText}
+                onChange={(e) => setReplyText(e.target.value)}
+                rows={2}
+                className="w-full px-3 py-2 pr-10 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none bg-gray-50 transition-all duration-150"
+                placeholder="Write your reply..."
+                autoFocus
+              />
+              <div className="absolute right-3 top-2.5">
+                <VoiceRecorder
+                  onTranscriptionComplete={handleTranscriptionComplete}
+                  variant="inline"
+                  source="reply"
+                />
+              </div>
+            </div>
             <div className="flex gap-2">
               <button
                 onClick={handleSubmitReply}
