@@ -101,7 +101,7 @@ Create a `.env` file in the project root with your Supabase project credentials:
 VITE_SUPABASE_URL=https://your-supabase-project.supabase.co
 VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
 ```
-
+Create a project in supabase and get the url and anon key and replace it in the .env file
 ### Installation & Running Locally
 
 1. **Clone the repository**:
