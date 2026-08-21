@@ -1,0 +1,38 @@
+# Redeploy the main app (static Vite build) on Render.
+#
+# Run manually from the GitHub "Actions" tab -> "Run workflow".
+# Render rebuilds from the connected repository using the build command,
+# publish directory and environment variables configured in the Render
+# dashboard - this hook only triggers that build.
+#
+# Required repository secret (see docs/DEPLOYMENT.md §7):
+#   RENDER_DEPLOY_HOOK - the Deploy Hook URL from the Render static site
+#                        (Settings -> Deploy Hook)
+
+name: Deploy main app (Render)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-main-app
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Trigger Render deploy hook
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}")
+          echo "Render responded with HTTP ${HTTP_CODE}"
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "::error::Deploy hook failed - check RENDER_DEPLOY_HOOK secret"
+            exit 1
+          fi
+          echo "Deploy triggered. Watch progress at https://dashboard.render.com"

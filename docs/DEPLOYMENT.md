@@ -1,8 +1,11 @@
-# vMTB Deployment Guide — first time, end to end
+# vMTB Deployment Guide — everything from scratch
 
-This is the **only** document you need to deploy the whole platform from
-scratch, link every URL, and run a real test. Follow top to bottom; don't skip
-the "one-time" sections.
+This is the **only** document you need to take an empty cloud account to a
+fully working platform: GCP backend, Jitsi VM, Render app, Vercel frontend,
+CI/CD buttons in GitHub, then a real end-to-end test.
+
+Follow top to bottom. Steps marked **(one-time)** never need repeating.
+If you already did part of §2 (e.g. bucket/Pub/Sub), just skip those blocks.
 
 Total time estimate: **half a day** (most of it waiting on builds/quota/DNS).
 
@@ -12,51 +15,69 @@ Total time estimate: **half a day** (most of it waiting on builds/quota/DNS).
 
 | Component | Where | URL |
 |---|---|---|
-| `main/` app | Render (existing) | your main app URL |
-| `jitsi-frontend/` | Vercel (existing) | `https://server.vmtb.in` |
+| `main/` app | Render Static Site (**new**, §7.1) | `https://vmtb-main.onrender.com` |
+| `jitsi-frontend/` | Vercel (**new**, §7.2) | `https://<you>.vercel.app` |
 | `stt-service` (GPU Whisper) | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
 | `opus-transcriber-proxy` | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
 | `transcript-worker` | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
 | `jitsi-activation-backend` | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
-| `jitsi-vm` (JVB/Prosody/Jicofo) | Compute Engine, `asia-south1-c` | `https://<VM_IP>` (**new**; custom domain later, §6.7) |
+| `jitsi-vm` (JVB/Prosody/Jicofo) | Compute Engine, `asia-south1-c` (**new**, §6) | `https://<VM_IP>` (custom domain later, §6.7) |
 | Transcript artifacts | GCS `gs://vmtb-transcripts` | internal |
 | Minutes-of-Meeting LLM | Mistral API | external |
 
 Everything Cloud Run is **scale-to-zero** (no idle cost). The VM and the warm
 GPU only bill while a meeting is active (see §9).
 
+### CI/CD model
+
+Every deployable unit has its own **manual button** in GitHub → Actions
+(`workflow_dispatch`) — nothing deploys on every commit unless you also keep
+the Vercel/Render git-integration enabled (optional):
+
+| Button (workflow) | Deploys | Mechanism |
+|---|---|---|
+| Deploy stt-service | Cloud Run GPU | Cloud Build → Cloud Run |
+| Deploy opus-transcriber-proxy | Cloud Run | Cloud Build → Cloud Run |
+| Deploy transcript-worker | Cloud Run | Cloud Build → Cloud Run (+ repairs Pub/Sub wiring) |
+| Deploy jitsi-activation-backend | Cloud Run | Cloud Build → Cloud Run |
+| Deploy jitsi-frontend (Vercel) | Vercel prod | Vercel CLI (`vercel deploy --prod`) |
+| Deploy main app (Render) | Render static site | Render Deploy Hook |
+
 ### How every URL connects (master wiring table)
 
 | # | From → To | Value | Set where | When |
 |---|---|---|---|---|
-| 1 | main app → jitsi-frontend | `VITE_SERVER_LOADER_URL=https://server.vmtb.in` | Render env vars | §8.1 |
-| 2 | jitsi-frontend → activation backend | `VITE_JITSI_BACKEND_URL=<ACT_URL>` | Vercel env vars | §8.2 |
-| 3 | activation backend → Jitsi VM | name `jitsi-vm`, zone `asia-south1-c` | baked into workflow | automatic |
-| 4 | activation backend → STT/proxy | service names (Cloud Run API) | baked into workflow | automatic |
-| 5 | proxy → STT | `STT_WS_URL` fetched at deploy time | proxy workflow | automatic |
-| 6 | Pub/Sub → worker | push subscription w/ token | worker workflow | automatic |
-| 7 | worker → GCS/Supabase/Mistral | secrets | Secret Manager | §2.6, §7 |
-| 8 | **Jicofo (VM) → proxy** | `wss://<PROXY_URL>/transcribe?...` | `jicofo.conf` on VM | §6.5 (manual!) |
-| 9 | browsers → VM | the VM's raw IP (self-signed cert) | nothing to set — IP is the URL | §6.2 |
+| 1 | main app → jitsi-frontend | `VITE_SERVER_LOADER_URL=<vercel-url>` | Render env vars | §7.3 (manual!) |
+| 2 | jitsi-frontend → activation backend | `VITE_JITSI_BACKEND_URL=<ACT_URL>` | Vercel env vars | §7.2 (manual!) |
+| 3 | jitsi-frontend → main app | `VITE_MAIN_APP_URL=<render-url>` | Vercel env vars | §7.2 (manual!) |
+| 4 | activation backend → Jitsi VM | name `jitsi-vm`, zone `asia-south1-c` | baked into workflow | automatic |
+| 5 | activation backend → STT/proxy | service names (Cloud Run API) | baked into workflow | automatic |
+| 6 | proxy → STT | `STT_WS_URL` fetched at deploy time | proxy workflow | automatic |
+| 7 | Pub/Sub → worker | push subscription w/ token | worker workflow | automatic |
+| 8 | worker → GCS/Supabase/Mistral | secrets | Secret Manager | §2.4, §5 |
+| 9 | **Jicofo (VM) → proxy** | `wss://<PROXY_URL>/transcribe?...` | `jicofo.conf` on VM | §6.5 (manual!) |
+| 10 | browsers → VM | the VM's raw IP (self-signed cert) | nothing to set — IP is the URL | §6.2 |
 
-Only #1, #2, #8 are manual — everything else self-wires during deploys.
+Manual links: #1, #2, #3, #9. Everything else self-wires during deploys.
 (DNS/domain linking is deliberately deferred to §6.7.)
 
 ---
 
 ## 1. Prerequisites
 
-- A GCP project with billing enabled. Collect:
+- GCP project with billing enabled (✅ you have this). Collect:
   ```bash
   gcloud auth login && gcloud config set project YOUR_PROJECT_ID
   gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)'
   ```
-- Owner/editor rights on the project (for the one-time IAM setup).
-- Your GitHub repo name, e.g. `harishbabu2007/vMTB-Veritas`.
-- DNS access for `vmtb.in` — **not needed initially** (raw VM IP for now);
-  required later per §6.7.
+- Owner/editor rights on the GCP project (for one-time IAM setup).
+- Your GitHub repo pushed and Actions enabled, e.g. `harishbabu2007/vMTB-Veritas`.
+- A [Vercel](https://vercel.com) account (sign in with GitHub).
+- A [Render](https://render.com) account (sign in with GitHub).
 - A [Mistral](https://console.mistral.ai/) account (free tier OK).
 - Supabase project URL, anon key and **service role key**.
+- DNS access for `vmtb.in` — **not needed initially** (raw VM IP); required
+  later per §6.7.
 
 ---
 
@@ -73,17 +94,20 @@ gcloud services enable \
   secretmanager.googleapis.com iamcredentials.googleapis.com
 ```
 
-### 2.2 Artifact Registry, bucket, Pub/Sub topic
+### 2.2 Artifact Registry, bucket, Pub/Sub topic *(skip what you already made)*
 
 ```bash
 gcloud artifacts repositories create vmtb-services \
   --repository-format=docker --location=asia-southeast1
 
 gcloud storage buckets create gs://vmtb-transcripts \
-  --location=asia-southeast1 --uniform-bucket-level-access
+  --location=asia-southeast1 --uniform-bucket-level-access   # ✅ if already created
 
-gcloud pubsub topics create meeting-transcripts
+gcloud pubsub topics create meeting-transcripts              # ✅ if already created
 ```
+
+(The push subscription is created automatically by the transcript-worker
+workflow — no manual step.)
 
 ### 2.3 Service accounts & permissions
 
@@ -127,8 +151,7 @@ printf '%s' 'PASTE_SERVICE_ROLE_KEY' | \
   gcloud secrets create supabase-service-role-key --data-file=- --replication-policy=automatic
 openssl rand -hex 24 | \
   gcloud secrets create pubsub-push-token --data-file=- --replication-policy=automatic
-# llm-api-key is created in §7 (Mistral) — the worker deploy expects it,
-# so either do §7 first or create an empty placeholder now:
+# llm-api-key is filled with the real Mistral key in §5; placeholder until then:
 printf '%s' 'placeholder' | \
   gcloud secrets create llm-api-key --data-file=- --replication-policy=automatic
 
@@ -145,7 +168,7 @@ Console → **IAM & Admin → Quotas & System Limits** → filter `NVIDIA_L4_GPU
 region `asia-southeast1` → **Edit** → request **1**.
 Without this the stt-service deploy fails.
 
-### 2.6 GitHub Actions authentication (Workload Identity Federation)
+### 2.6 GitHub Actions authentication for GCP (Workload Identity Federation)
 
 No keys stored in GitHub — OIDC token exchange:
 
@@ -168,13 +191,22 @@ gcloud iam service-accounts add-iam-policy-binding \
   --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github-pool/attribute.repository/${GH_REPO}"
 ```
 
-Add three secrets in GitHub → **Settings → Secrets and variables → Actions**:
+### 2.7 All GitHub repository secrets (do this once)
 
-| Name | Value |
-|---|---|
-| `GCP_PROJECT_ID` | your project id |
-| `GCP_WIF_PROVIDER` | `projects/YOUR_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider` |
-| `GCP_DEPLOY_SA` | `vmtb-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com` |
+GitHub → **Settings → Secrets and variables → Actions → New repository secret**:
+
+| Secret | Value | From |
+|---|---|---|
+| `GCP_PROJECT_ID` | your project id | §2 |
+| `GCP_WIF_PROVIDER` | `projects/YOUR_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider` | §2.6 |
+| `GCP_DEPLOY_SA` | `vmtb-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com` | §2.3 |
+| `RENDER_DEPLOY_HOOK` | Render deploy-hook URL | §7.1 step 5 |
+| `VERCEL_TOKEN` | Vercel personal access token | §7.2 step 4 |
+| `VERCEL_ORG_ID` | Vercel org/team id | §7.2 step 4 |
+| `VERCEL_PROJECT_ID` | Vercel project id | §7.2 step 4 |
+
+(GCP secrets can be added now; the Render/Vercel ones after §7 creates those
+projects.)
 
 ---
 
@@ -203,7 +235,6 @@ Then collect the URLs you'll need later:
 
 ```bash
 gcloud run services list --project YOUR_PROJECT_ID
-# save these two:
 PROXY_URL=$(gcloud run services describe opus-transcriber-proxy \
   --project YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
 ACT_URL=$(gcloud run services describe jitsi-activation-backend \
@@ -211,8 +242,8 @@ ACT_URL=$(gcloud run services describe jitsi-activation-backend \
 echo "PROXY=$PROXY_URL"; echo "ACT=$ACT_URL"
 ```
 
-> **Write down `PROXY_URL`** — you need it in §6.5 (Jicofo config).
-> **Write down `ACT_URL`** — you need it in §8 (frontends).
+> **Write down `PROXY_URL`** — needed in §6.5 (Jicofo config).
+> **Write down `ACT_URL`** — needed in §7 (frontends).
 
 ---
 
@@ -224,9 +255,8 @@ echo "PROXY=$PROXY_URL"; echo "ACT=$ACT_URL"
    printf '%s' 'YOUR_REAL_MISTRAL_KEY' | \
      gcloud secrets versions add llm-api-key --data-file=-
    ```
-3. Redeploy **transcript-worker** via its Action button so the new secret
-   version is picked up (or just wait — secret versions are resolved at
-   container start, so a redeploy guarantees it).
+3. Redeploy **transcript-worker** via its Action button so the running
+   container picks up the new secret version.
 4. Config already set in the workflow: `LLM_BASE_URL=https://api.mistral.ai/v1`,
    `LLM_MODEL=mistral-small-latest`. Transient 429/5xx errors are retried
    automatically (`transcript-worker/src/llm.ts`).
@@ -437,33 +467,80 @@ Do this only after the app works to your satisfaction. Summary:
 
 ---
 
-## 7. Frontends (URL linking)
+## 7. Frontends from scratch (Render + Vercel)
 
-### 7.1 `main/` on Render
+Both are static Vite builds. **Order matters** because their URLs point at
+each other: create Render first (its URL exists immediately), then Vercel,
+then loop back to Render once with the Vercel URL.
 
-Render dashboard → your service → **Environment**, then redeploy:
+### 7.1 Create the main app on Render
 
-| Var | Value |
-|---|---|
-| `VITE_SUPABASE_URL` | your Supabase URL |
-| `VITE_SUPABASE_ANON_KEY` | anon key |
-| `VITE_JITSI_BACKEND_URL` | `<ACT_URL>` from §4 |
-| `VITE_SERVER_LOADER_URL` | `https://server.vmtb.in` |
+1. <https://dashboard.render.com> → **New +** → **Static Site** → connect
+   your GitHub repo (grant access when prompted).
+2. Settings:
+   - **Name**: `vmtb-main` → URL becomes `https://vmtb-main.onrender.com`
+   - **Root Directory**: `main`
+   - **Build Command**: `npm ci && npm run build`
+   - **Publish Directory**: `dist`
+     *(if the first deploy fails complaining about a missing `dist`, change
+     this to `main/dist`)*
+3. **Environment Variables** (Add more → each row):
+   - `VITE_SUPABASE_URL` = your Supabase URL
+   - `VITE_SUPABASE_ANON_KEY` = anon key
+   - `VITE_JITSI_BACKEND_URL` = `<ACT_URL>` from §4
+   - `VITE_SERVER_LOADER_URL` = *(leave empty for now — filled in §7.3)*
+4. **SPA routing (required!)**: scroll to *Redirects/Rewrites* and add:
+   - Rule: `/*` → Rewrite → `/index.html`
+   Without this, refreshing any page other than home shows 404.
+5. Click **Create Static Site**. Wait for the first deploy to finish.
+6. Grab the deploy hook: service page → **Settings** → **Deploy Hook** →
+   copy the URL → add it as GitHub secret `RENDER_DEPLOY_HOOK` (§2.7).
 
-### 7.2 `jitsi-frontend/` on Vercel (`server.vmtb.in`)
+> Note the site URL `https://vmtb-main.onrender.com` — needed in §7.2.
 
-Vercel project → **Settings → Environment Variables**, then redeploy:
+### 7.2 Create jitsi-frontend on Vercel
 
-| Var | Value |
-|---|---|
-| `VITE_JITSI_BACKEND_URL` | `<ACT_URL>` from §4 |
-| `VITE_JITSI_DOMAIN` | `<VM_IP>` from §6.2 (switch to `meet.vmtb.in` later, §6.7) |
-| `VITE_MAIN_APP_URL` | your main app URL |
-| `VITE_SUPABASE_URL` | your Supabase URL |
-| `VITE_SUPABASE_ANON_KEY` | anon key |
+1. <https://vercel.com/new> → **Import** your GitHub repo.
+2. Configure:
+   - **Framework Preset**: Vite
+   - **Root Directory**: `jitsi-frontend` (Edit → select)
+   - Build command / output auto-detect from Vite (`npm run build` / `dist`)
+3. **Environment Variables** (Production):
+   - `VITE_JITSI_BACKEND_URL` = `<ACT_URL>` from §4
+   - `VITE_JITSI_DOMAIN` = `<VM_IP>` from §6.2 (switch to `meet.vmtb.in`
+     later per §6.7)
+   - `VITE_MAIN_APP_URL` = `https://vmtb-main.onrender.com` (from §7.1)
+   - `VITE_SUPABASE_URL` = your Supabase URL
+   - `VITE_SUPABASE_ANON_KEY` = anon key
+4. Click **Deploy**. When done, note your production URL
+   (e.g. `https://vmtb-jitsi.vercel.app` — visible at the top of the project).
+5. Get the CI/CD credentials:
+   - **Org ID + Project ID**: project → *Settings* → *General* →
+     "Vercel Organization ID" and "Vercel Project ID"
+     (or run `npx vercel link` inside `jitsi-frontend/` locally and open
+     `.vercel/project.json`)
+   - **Token**: <https://vercel.com/account/settings/tokens> → *Create*
+6. Add three GitHub secrets (§2.7): `VERCEL_TOKEN`, `VERCEL_ORG_ID`,
+   `VERCEL_PROJECT_ID`.
 
-> `VITE_*` vars are baked at **build time** — changing them requires a
-> redeploy, they never apply retroactively.
+From now on, **Actions → Deploy jitsi-frontend (Vercel)** rebuilds and ships
+it. (Vercel's git-integration also auto-deploys on push; disable it under
+Settings → Git if you want button-only deploys.)
+
+### 7.3 Loop back: point the main app at the loader
+
+Render dashboard → `vmtb-main` → **Environment**:
+
+- Set `VITE_SERVER_LOADER_URL` = your Vercel production URL from §7.2
+
+Then trigger **Actions → Deploy main app (Render)** (env var changes only
+apply after a redeploy).
+
+### 7.4 Verify the frontends
+
+- Open the Render URL → log in → you should see your cases/MTBs.
+- Open the Vercel URL directly with no params → you should see the friendly
+  error page ("No room name provided…") — that proves it loads.
 
 ---
 
@@ -478,8 +555,8 @@ Do this exactly once, in order, and note anything that breaks.
    browser you'll test from and click through the warning (*Advanced →
    Proceed anyway*). Without this, the embedded meeting iframe fails silently.
 3. **Start a meeting** — main app → MTB → *Meeting* → *Start Meeting*.
-   The loader polls `/start-jitsi`; expect **1–3 min** (VM boot + GPU alloc +
-   model load) before the room opens.
+   It opens the Vercel loader, which polls `/start-jitsi`; expect **1–3 min**
+   (VM boot + GPU alloc + model load) before the room opens.
 4. **Talk** — join from a second device/tab if possible. With
    `force_async_transcription` installed, JVB should connect to the proxy
    automatically. Captions appear because `sendBack=true`.
@@ -522,6 +599,7 @@ ws.on("message", (m) => console.log(m.toString()));
     --uri="$ACT_URL/stop-jitsi" --http-method=POST
   ```
   (enable Cloud Scheduler API if prompted)
+- Render static sites and Vercel hobby projects are free at this scale.
 
 ---
 
@@ -540,4 +618,8 @@ ws.on("message", (m) => console.log(m.toString()));
 | WebSocket drops at exactly 60 min | Cloud Run hard cap; proxy/STT reconnect automatically — acceptable for MVP |
 | CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend, redeploy |
 | Meeting iframe blank / external_api.js fails to load | the self-signed cert wasn't accepted in that browser yet — visit `https://<VM_IP>` directly and proceed past the warning (§8 step 2) |
+| Render site 404s on refresh / deep links | missing SPA rewrite rule `/* → /index.html` (§7.1 step 4) |
+| Frontend shows old backend URLs after env change | `VITE_*` vars bake at build time — trigger the deploy button again |
+| Vercel workflow fails auth | wrong/expired `VERCEL_TOKEN`, or org/project ids swapped |
+| Render hook returns non-200 | `RENDER_DEPLOY_HOOK` secret stale — re-copy from Render settings |
 | Let's Encrypt fails later (§6.7) | DNS not propagated yet, or port 80 blocked (§6.1) |
