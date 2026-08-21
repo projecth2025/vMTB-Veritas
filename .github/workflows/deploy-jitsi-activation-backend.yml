@@ -1,0 +1,86 @@
+# Deploy jitsi-activation-backend (meeting infrastructure activator) to Cloud Run.
+#
+# This service starts/stops the Jitsi VM and wakes the scale-to-zero STT and
+# proxy services before a meeting. It runs with Application Default
+# Credentials - the runtime service account below needs:
+#   roles/compute.instanceAdmin.v1 (or scoped start/stop/get on jitsi-vm)
+#   roles/run.developer            (read + update stt-service / proxy)
+#   actAs on vmtb-services@...     (to patch services that use that SA)
+# See docs/DEPLOYMENT.md for the exact commands.
+#
+# Required repository secrets: GCP_PROJECT_ID, GCP_WIF_PROVIDER, GCP_DEPLOY_SA
+
+name: Deploy jitsi-activation-backend
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag (default: git short sha)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-jitsi-activation-backend
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: asia-southeast1
+  REPO: vmtb-services
+  SERVICE: jitsi-activation-backend
+  RUNTIME_SA: vmtb-activator
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build image (Cloud Build)
+        run: |
+          gcloud builds submit "$SERVICE" \
+            --project "$PROJECT_ID" \
+            --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}"
+
+      # Public (allow-unauthenticated): the browser-based jitsi-frontend polls
+      # /start-jitsi directly, exactly like the previous Render deployment.
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "$SERVICE" \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --image "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}" \
+            --service-account "$RUNTIME_SA@$PROJECT_ID.iam.gserviceaccount.com" \
+            --allow-unauthenticated \
+            --min-instances 0 \
+            --max-instances 3 \
+            --timeout 120 \
+            --set-env-vars "GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=asia-south1-c,JITSI_INSTANCE_NAME=jitsi-vm,GCP_REGION=$REGION,STT_SERVICE_NAME=stt-service,PROXY_SERVICE_NAME=opus-transcriber-proxy"
+
+      - name: Show service URL
+        run: |
+          gcloud run services describe "$SERVICE" \
+            --project "$PROJECT_ID" --region "$REGION" \
+            --format 'value(status.url)'

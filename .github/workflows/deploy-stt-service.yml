@@ -1,0 +1,92 @@
+# Deploy stt-service (streaming Whisper) to Cloud Run with an L4 GPU.
+#
+# Run manually from the GitHub "Actions" tab -> select this workflow -> "Run
+# workflow". Build takes a while the first time (~15 min: CUDA wheels + the
+# baked `medium` model), later builds are faster thanks to layer caching.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   GCP_PROJECT_ID      - your GCP project id
+#   GCP_WIF_PROVIDER    - Workload Identity Federation provider resource name
+#   GCP_DEPLOY_SA       - deployer service account email
+# See docs/DEPLOYMENT.md for one-time setup of all three.
+
+name: Deploy stt-service
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag (default: git short sha)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
+concurrency:
+  group: deploy-stt-service
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: asia-southeast1 # must be a Cloud Run GPU region (L4)
+  REPO: vmtb-services
+  SERVICE: stt-service
+  RUNTIME_SA: vmtb-services # runtime service account (name only)
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build image (Cloud Build)
+        run: |
+          gcloud builds submit "$SERVICE" \
+            --project "$PROJECT_ID" \
+            --machine-type e2-highcpu-8 \
+            --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}" \
+            --build-arg STT_DEVICE=gpu \
+            --build-arg STT_MODEL=medium
+
+      - name: Deploy to Cloud Run (GPU)
+        run: |
+          gcloud run deploy "$SERVICE" \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --image "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}" \
+            --service-account "$RUNTIME_SA@$PROJECT_ID.iam.gserviceaccount.com" \
+            --gpu 1 \
+            --gpu-type nvidia-l4 \
+            --memory 16Gi \
+            --cpu 4 \
+            --concurrency 1 \
+            --min-instances 0 \
+            --max-instances 2 \
+            --timeout 3600 \
+            --no-allow-unauthenticated \
+            --set-env-vars "STT_MODEL=medium,STT_DEVICE=cuda,STT_COMPUTE_TYPE=float16"
+
+      - name: Show service URL
+        run: |
+          gcloud run services describe "$SERVICE" \
+            --project "$PROJECT_ID" --region "$REGION" \
+            --format 'value(status.url)'
