@@ -18,7 +18,7 @@ Total time estimate: **half a day** (most of it waiting on builds/quota/DNS).
 | `opus-transcriber-proxy` | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
 | `transcript-worker` | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
 | `jitsi-activation-backend` | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
-| `jitsi-vm` (JVB/Prosody/Jicofo) | Compute Engine, `asia-south1-c` | `https://meet.vmtb.in` (**new**) |
+| `jitsi-vm` (JVB/Prosody/Jicofo) | Compute Engine, `asia-south1-c` | `https://<VM_IP>` (**new**; custom domain later, §6.7) |
 | Transcript artifacts | GCS `gs://vmtb-transcripts` | internal |
 | Minutes-of-Meeting LLM | Mistral API | external |
 
@@ -37,9 +37,10 @@ GPU only bill while a meeting is active (see §9).
 | 6 | Pub/Sub → worker | push subscription w/ token | worker workflow | automatic |
 | 7 | worker → GCS/Supabase/Mistral | secrets | Secret Manager | §2.6, §7 |
 | 8 | **Jicofo (VM) → proxy** | `wss://<PROXY_URL>/transcribe?...` | `jicofo.conf` on VM | §6.5 (manual!) |
-| 9 | browsers → VM | DNS A record `meet.vmtb.in` | your DNS provider | §6.3 (manual!) |
+| 9 | browsers → VM | the VM's raw IP (self-signed cert) | nothing to set — IP is the URL | §6.2 |
 
-Only #1, #2, #8, #9 are manual — everything else self-wires during deploys.
+Only #1, #2, #8 are manual — everything else self-wires during deploys.
+(DNS/domain linking is deliberately deferred to §6.7.)
 
 ---
 
@@ -52,7 +53,8 @@ Only #1, #2, #8, #9 are manual — everything else self-wires during deploys.
   ```
 - Owner/editor rights on the project (for the one-time IAM setup).
 - Your GitHub repo name, e.g. `harishbabu2007/vMTB-Veritas`.
-- Access to the DNS settings for `vmtb.in`.
+- DNS access for `vmtb.in` — **not needed initially** (raw VM IP for now);
+  required later per §6.7.
 - A [Mistral](https://console.mistral.ai/) account (free tier OK).
 - Supabase project URL, anon key and **service role key**.
 
@@ -240,7 +242,7 @@ curl https://api.mistral.ai/v1/chat/completions \
 
 ---
 
-## 6. Jitsi VM from scratch (`meet.vmtb.in`)
+## 6. Jitsi VM from scratch (raw IP for now, domain later)
 
 This creates the VM that runs JVB (media), Prosody (XMPP), Jicofo (conference
 logic) and nginx. Nothing else in the pipeline works without it.
@@ -272,21 +274,18 @@ gcloud compute instances create jitsi-vm \
 `e2-standard-4` (4 vCPU / 16 GB) comfortably hosts small tumor-board meetings.
 For pure cost saving with ≤5 participants you can drop to `e2-standard-2`.
 
-### 6.3 DNS (do this NOW — Let's Encrypt needs it)
-
-At your DNS provider for `vmtb.in`, create:
-
-```
-Type: A   Host: meet   Value: <VM_EXTERNAL_IP>   TTL: 300
-```
-
-Get the IP with `gcloud compute instances describe jitsi-vm \
---zone=asia-south1-c --format='value(networkInterfaces[0].accessConfigs[0].natIP)'`.
-Wait until this resolves before continuing:
+Note the VM's external IP — it is your meeting URL for now:
 
 ```bash
-dig +short meet.vmtb.in   # must print the VM IP
+gcloud compute instances describe jitsi-vm \
+  --zone=asia-south1-c --format='value(networkInterfaces[0].accessConfigs[0].natIP)'
 ```
+
+### 6.3 DNS — skipped for now
+
+We install Jitsi against the **raw VM IP** with a self-signed certificate, so
+no DNS record is needed yet. When you're happy with the app, follow §6.7 to
+switch to `meet.vmtb.in` properly.
 
 ### 6.4 Install Jitsi Meet on the VM
 
@@ -294,12 +293,10 @@ dig +short meet.vmtb.in   # must print the VM IP
 gcloud compute ssh jitsi-vm --zone=asia-south1-c
 ```
 
-Then on the VM:
+Then on the VM (replace `<VM_IP>` with the external IP from §6.2):
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo hostnamectl set-hostname meet.vmtb.in
-echo "127.0.0.1 meet.vmtb.in" | sudo tee -a /etc/hosts
 
 curl https://download.jitsi.org/jitsi-key.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/jitsi-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/jitsi-keyring.gpg] https://download.jitsi.org/ stable/" | \
@@ -309,19 +306,16 @@ sudo apt install -y jitsi-meet
 ```
 
 During installation it prompts twice:
-- **FQDN**: type exactly `meet.vmtb.in`
-- **Certificate**: choose *"Generate a new self-signed certificate"* (we
-  replace it with Let's Encrypt next)
+- **FQDN**: type the VM's external IP (e.g. `35.200.123.45`)
+- **Certificate**: choose *"Generate a new self-signed certificate"* — fine
+  for testing; browsers will show a one-time warning you accept.
 
-Now get a real TLS certificate:
-
-```bash
-sudo /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
-# enter your email when prompted
-```
-
-Open `https://meet.vmtb.in` in a browser — you should see the Jitsi welcome
+Open `https://<VM_IP>` in a browser, click through the certificate warning
+(Chrome: *Advanced → Proceed anyway*), and you should see the Jitsi welcome
 page. Meetings already work at this point; transcription comes next.
+
+> Accepting the warning once per browser is required **before** starting
+> meetings from the app, because the meeting is embedded from this same IP.
 
 ### 6.5 Wire transcription to your proxy ← **the important part**
 
@@ -348,12 +342,13 @@ EOF
 
 **(b) Enable the module on the conference component**
 
-Edit `/etc/prosody/conf.avail/meet.vmtb.in.cfg.lua`. Find the block starting
-with `Component "conference.meet.vmtb.in" "muc"` and make sure its
-`modules_enabled` list contains both entries:
+Edit `/etc/prosody/conf.avail/<VM_IP>.cfg.lua` (the file is named after the
+FQDN you entered, i.e. the IP). Find the block starting with
+`Component "conference.<VM_IP>" "muc"` and make sure its `modules_enabled`
+list contains both entries:
 
 ```lua
-Component "conference.meet.vmtb.in" "muc"
+Component "conference.<VM_IP>" "muc"
     ...
     modules_enabled = {
         "muc_meeting_id";           -- usually already present
@@ -384,7 +379,7 @@ jicofo {
 
 **(d) Enable the toggle in the client**
 
-Edit `/etc/jitsi/meet/meet.vmtb.in-config.js` and add:
+Edit `/etc/jitsi/meet/<VM_IP>-config.js` and add:
 
 ```js
 transcription: {
@@ -419,6 +414,27 @@ curl -s -X POST "$ACT_URL/stop-jitsi"
 If `jvb` shows `error`, re-check §2.3 IAM bindings and the activation
 backend's Cloud Run logs.
 
+### 6.7 Later: switching to `meet.vmtb.in` (custom domain)
+
+Do this only after the app works to your satisfaction. Summary:
+
+1. Add the DNS A record `meet → <VM_IP>` at your DNS provider and wait for
+   propagation (`dig +short meet.vmtb.in`).
+2. On the VM:
+   ```bash
+   sudo hostnamectl set-hostname meet.vmtb.in
+   echo "127.0.0.1 meet.vmtb.in" | sudo tee -a /etc/hosts
+   sudo /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
+   ```
+   If the cert script complains about the old self-signed config, re-run
+   `sudo apt install -y jitsi-meet` and answer the FQDN prompt with
+   `meet.vmtb.in` — it regenerates nginx/prosody/jicofo config for the new
+   name (your §6.5 edits must then be re-applied to the *new* file names:
+   `/etc/prosody/conf.avail/meet.vmtb.in.cfg.lua`,
+   `/etc/jitsi/meet/meet.vmtb.in-config.js`).
+3. Update `VITE_JITSI_DOMAIN=meet.vmtb.in` on Vercel (§7.2) and redeploy.
+4. Ask me when you get here — we'll do it together.
+
 ---
 
 ## 7. Frontends (URL linking)
@@ -441,7 +457,7 @@ Vercel project → **Settings → Environment Variables**, then redeploy:
 | Var | Value |
 |---|---|
 | `VITE_JITSI_BACKEND_URL` | `<ACT_URL>` from §4 |
-| `VITE_JITSI_DOMAIN` | `meet.vmtb.in` |
+| `VITE_JITSI_DOMAIN` | `<VM_IP>` from §6.2 (switch to `meet.vmtb.in` later, §6.7) |
 | `VITE_MAIN_APP_URL` | your main app URL |
 | `VITE_SUPABASE_URL` | your Supabase URL |
 | `VITE_SUPABASE_ANON_KEY` | anon key |
@@ -458,22 +474,25 @@ Do this exactly once, in order, and note anything that breaks.
 1. **Cold state**
    `curl -s $ACT_URL/status | python3 -m json.tool`
    → jvb `TERMINATED`, stt `cold`, proxy `cold`.
-2. **Start a meeting** — main app → MTB → *Meeting* → *Start Meeting*.
+2. **Accept the VM's self-signed cert once** — open `https://<VM_IP>` in the
+   browser you'll test from and click through the warning (*Advanced →
+   Proceed anyway*). Without this, the embedded meeting iframe fails silently.
+3. **Start a meeting** — main app → MTB → *Meeting* → *Start Meeting*.
    The loader polls `/start-jitsi`; expect **1–3 min** (VM boot + GPU alloc +
    model load) before the room opens.
-3. **Talk** — join from a second device/tab if possible. With
+4. **Talk** — join from a second device/tab if possible. With
    `force_async_transcription` installed, JVB should connect to the proxy
    automatically. Captions appear because `sendBack=true`.
    Check: proxy logs (Cloud Run → opus-transcriber-proxy → Logs) show
    `transcription session opened`.
-4. **Segments land** — Supabase → Table Editor →
+5. **Segments land** — Supabase → Table Editor →
    `meeting_transcript_segments`: FINAL rows appear within seconds of speech.
-5. **End the meeting** — leave/end for everyone. Within ~1 min:
+6. **End the meeting** — leave/end for everyone. Within ~1 min:
    - `meeting_transcripts.status` → `COMPLETED`
    - `gs://vmtb-transcripts/meetings/<meeting_id>/transcript/transcript-v1.{json,txt}` exist
    - `minutes_of_meeting` column filled with Mistral JSON
      (summary / decisions / action_items).
-6. **Tear down**
+7. **Tear down**
    `curl -X POST $ACT_URL/stop-jitsi` then confirm `/status` shows all
    stopped/cold. **Never skip this** — the warm GPU bills ~$0.80/hr.
 
@@ -520,4 +539,5 @@ ws.on("message", (m) => console.log(m.toString()));
 | Meeting FAILED with LLM error | bad/expired Mistral key → fix `llm-api-key` secret, redeploy worker |
 | WebSocket drops at exactly 60 min | Cloud Run hard cap; proxy/STT reconnect automatically — acceptable for MVP |
 | CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend, redeploy |
-| Let's Encrypt fails on VM | DNS not propagated yet (§6.3) or port 80 blocked (§6.1) |
+| Meeting iframe blank / external_api.js fails to load | the self-signed cert wasn't accepted in that browser yet — visit `https://<VM_IP>` directly and proceed past the warning (§8 step 2) |
+| Let's Encrypt fails later (§6.7) | DNS not propagated yet, or port 80 blocked (§6.1) |
