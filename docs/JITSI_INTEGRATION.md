@@ -23,23 +23,29 @@ With bridge-based transcription:
 
 ## 1. Prosody — enable transcription
 
-In `prosody.cfg.lua`, inside the MUC host (e.g. `muc.meet.example.com`), add:
+Transcription is gated by room metadata (`asyncTranscription`), which clients
+cannot set themselves — it must be forced server-side. The standard approach
+is a small Prosody module (`mod_force_async_transcription.lua`) hooked on the
+conference MUC component; see **docs/DEPLOYMENT.md §6.5** for the exact
+copy-paste module and config for `meet.vmtb.in`.
 
-```lua
-muc_room_metadata = {
-    ["org.jitsi.meet"] = { transcription = { enabled = true } },
-}
-```
-
-This tells Jicofo that rooms can request transcription. (You can also set it per
-room via `config.js` `transcription.enabled = true`.)
+Reference: <https://jitsi.github.io/handbook/docs/devops-guide/transcription/>
 
 ## 2. Jicofo — point transcription at the proxy
 
-In `jicofo.conf`:
+In `jicofo.conf`, inside the top-level `jicofo { ... }` block:
 
 ```
-jicofo.transcription.url-template = "wss://PROXY_URL/transcribe?sessionId={{MEETING_ID}}&sendBack=true"
+jicofo {
+  transcription {
+    url-template = "wss://PROXY_URL/transcribe?sessionId={{MEETING_ID}}&sendBack=true"
+    ping {
+      enabled = true
+      interval = 10 seconds
+      timeout = 3 seconds
+    }
+  }
+}
 ```
 
 - `{{MEETING_ID}}` is the Jitsi conference meeting id. This is the value the

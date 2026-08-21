@@ -1,154 +1,135 @@
-# vMTB Deployment Guide (GCP + GitHub Actions)
+# vMTB Deployment Guide — first time, end to end
 
-Deploy every backend service to Google Cloud, trigger builds/deploys with
-buttons in the GitHub **Actions** tab, then test the whole application
-end-to-end.
+This is the **only** document you need to deploy the whole platform from
+scratch, link every URL, and run a real test. Follow top to bottom; don't skip
+the "one-time" sections.
 
-**Region layout** (chosen for cost + GPU availability):
+Total time estimate: **half a day** (most of it waiting on builds/quota/DNS).
 
-| Component | Where | Why |
+---
+
+## 0. What you are building
+
+| Component | Where | URL |
 |---|---|---|
-| `stt-service` (GPU Whisper) | Cloud Run, `asia-southeast1` (Singapore) | L4 GPUs available; `asia-south1` L4 is invite-only |
-| `opus-transcriber-proxy` | Cloud Run, `asia-southeast1` | co-located with STT (streams audio to it) |
-| `transcript-worker` | Cloud Run, `asia-southeast1` | async post-meeting job |
-| `jitsi-activation-backend` | Cloud Run, `asia-southeast1` | wakes/stops everything below |
-| `jitsi-vm` (JVB/Prosody/Jicofo) | Compute Engine, `asia-south1-c` (Mumbai) | low media latency for Indian users |
-| `main/` app | Render (unchanged) | existing deployment |
-| `jitsi-frontend/` | Vercel (`server.vmtb.in`) | existing deployment |
+| `main/` app | Render (existing) | your main app URL |
+| `jitsi-frontend/` | Vercel (existing) | `https://server.vmtb.in` |
+| `stt-service` (GPU Whisper) | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
+| `opus-transcriber-proxy` | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
+| `transcript-worker` | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
+| `jitsi-activation-backend` | Cloud Run, `asia-southeast1` | assigned by Cloud Run |
+| `jitsi-vm` (JVB/Prosody/Jicofo) | Compute Engine, `asia-south1-c` | `https://meet.vmtb.in` (**new**) |
+| Transcript artifacts | GCS `gs://vmtb-transcripts` | internal |
+| Minutes-of-Meeting LLM | Mistral API | external |
 
-Everything is **scale-to-zero**: STT and proxy run with `--min-instances 0`
-and only bill while woken up by the activation backend for a meeting.
+Everything Cloud Run is **scale-to-zero** (no idle cost). The VM and the warm
+GPU only bill while a meeting is active (see §9).
 
-```
- Start Meeting (main app)
-   └─> server.vmtb.in (jitsi-frontend) ──polls──> POST /start-jitsi (activation backend)
-                                                    ├─ starts jitsi-vm (Compute Engine)
-                                                    ├─ wakes stt-service (min-instances 0→1)
-                                                    └─ wakes opus-transcriber-proxy (0→1)
-   poll returns already_running only when ALL THREE are healthy
-   └─> browser joins meet.vmtb.in/<room>
-        JVB ──WSS──> proxy ──WSS(+ID token)──> stt-service ──finals──> Supabase
-        meeting ends ──> Pub/Sub meeting.completed ──> transcript-worker
-                         claim → GCS artifacts → Mistral MoM → COMPLETED
-```
+### How every URL connects (master wiring table)
+
+| # | From → To | Value | Set where | When |
+|---|---|---|---|---|
+| 1 | main app → jitsi-frontend | `VITE_SERVER_LOADER_URL=https://server.vmtb.in` | Render env vars | §8.1 |
+| 2 | jitsi-frontend → activation backend | `VITE_JITSI_BACKEND_URL=<ACT_URL>` | Vercel env vars | §8.2 |
+| 3 | activation backend → Jitsi VM | name `jitsi-vm`, zone `asia-south1-c` | baked into workflow | automatic |
+| 4 | activation backend → STT/proxy | service names (Cloud Run API) | baked into workflow | automatic |
+| 5 | proxy → STT | `STT_WS_URL` fetched at deploy time | proxy workflow | automatic |
+| 6 | Pub/Sub → worker | push subscription w/ token | worker workflow | automatic |
+| 7 | worker → GCS/Supabase/Mistral | secrets | Secret Manager | §2.6, §7 |
+| 8 | **Jicofo (VM) → proxy** | `wss://<PROXY_URL>/transcribe?...` | `jicofo.conf` on VM | §6.5 (manual!) |
+| 9 | browsers → VM | DNS A record `meet.vmtb.in` | your DNS provider | §6.3 (manual!) |
+
+Only #1, #2, #8, #9 are manual — everything else self-wires during deploys.
 
 ---
 
-## 0. Prerequisites
+## 1. Prerequisites
 
-- A GCP project with billing enabled. Note your **project id**
-  (`gcloud config get-value project`) and **project number**
-  (`gcloud projects describe PROJECT_ID --format='value(projectNumber)'`).
-- `gcloud` installed locally and authenticated:
+- A GCP project with billing enabled. Collect:
   ```bash
-  gcloud auth login
-  gcloud config set project YOUR_PROJECT_ID
+  gcloud auth login && gcloud config set project YOUR_PROJECT_ID
+  gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)'
   ```
-- Your GitHub fork/repo name (e.g. `youruser/vMTB-Veritas`).
-- A [Mistral](https://console.mistral.ai/) account (free tier is fine to start).
-- Supabase project credentials (URL + anon key + **service role key**).
+- Owner/editor rights on the project (for the one-time IAM setup).
+- Your GitHub repo name, e.g. `harishbabu2007/vMTB-Veritas`.
+- Access to the DNS settings for `vmtb.in`.
+- A [Mistral](https://console.mistral.ai/) account (free tier OK).
+- Supabase project URL, anon key and **service role key**.
 
 ---
 
-## 1. One-time GCP setup
+## 2. One-time GCP setup
 
-Copy-paste each block, replacing `YOUR_PROJECT_ID` / `YOUR_GH_USER`.
+Replace `YOUR_PROJECT_ID`, `YOUR_PROJECT_NUMBER`, `YOUR_GH_USER` everywhere.
 
-### 1.1 Enable APIs
+### 2.1 Enable APIs
 
 ```bash
 gcloud services enable \
-  run.googleapis.com \
-  compute.googleapis.com \
-  artifactregistry.googleapis.com \
-  pubsub.googleapis.com \
-  storage.googleapis.com \
-  cloudbuild.googleapis.com \
-  secretmanager.googleapis.com \
-  iamcredentials.googleapis.com
+  run.googleapis.com compute.googleapis.com artifactregistry.googleapis.com \
+  pubsub.googleapis.com storage.googleapis.com cloudbuild.googleapis.com \
+  secretmanager.googleapis.com iamcredentials.googleapis.com
 ```
 
-### 1.2 Artifact Registry (container images)
+### 2.2 Artifact Registry, bucket, Pub/Sub topic
 
 ```bash
 gcloud artifacts repositories create vmtb-services \
   --repository-format=docker --location=asia-southeast1
-```
 
-### 1.3 Storage bucket (transcript artifacts)
-
-```bash
 gcloud storage buckets create gs://vmtb-transcripts \
   --location=asia-southeast1 --uniform-bucket-level-access
-```
 
-### 1.4 Pub/Sub topic
-
-```bash
 gcloud pubsub topics create meeting-transcripts
 ```
 
-(The push subscription is created after the worker is deployed — §3.4.)
-
-### 1.5 Service accounts & permissions
+### 2.3 Service accounts & permissions
 
 ```bash
-# Runtime SA for stt-service, proxy, transcript-worker
-gcloud iam service-accounts create vmtb-services \
-  --display-name="vMTB transcription services"
-
-# Runtime SA for the activation backend
-gcloud iam service-accounts create vmtb-activator \
-  --display-name="vMTB meeting activator"
-
-# CI/CD deployer (used by GitHub Actions via WIF)
-gcloud iam service-accounts create vmtb-deployer \
-  --display-name="vMTB CI deployer"
-
 PROJECT_ID=YOUR_PROJECT_ID
 
-# --- vmtb-services: invoke other services, write artifacts, read secrets ---
+gcloud iam service-accounts create vmtb-services   --display-name="vMTB transcription services"
+gcloud iam service-accounts create vmtb-activator  --display-name="vMTB meeting activator"
+gcloud iam service-accounts create vmtb-deployer   --display-name="vMTB CI deployer"
+
+# runtime SA: invoke services, write artifacts, read secrets, publish events
 for ROLE in roles/run.invoker roles/storage.objectAdmin roles/secretmanager.secretAccessor roles/pubsub.publisher; do
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:vmtb-services@$PROJECT_ID.iam.gserviceaccount.com" --role="$ROLE"
 done
 
-# --- vmtb-activator: start/stop the VM, wake/sleep Cloud Run services ---
+# activator SA: control the VM + wake/sleep Cloud Run services
 for ROLE in roles/compute.instanceAdmin.v1 roles/run.developer roles/run.invoker; do
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:vmtb-activator@$PROJECT_ID.iam.gserviceaccount.com" --role="$ROLE"
 done
-# Patching a service that runs as vmtb-services requires actAs on it:
 gcloud iam service-accounts add-iam-policy-binding \
   "vmtb-services@$PROJECT_ID.iam.gserviceaccount.com" \
   --member="serviceAccount:vmtb-activator@$PROJECT_ID.iam.gserviceaccount.com" \
   --role="roles/iam.serviceAccountUser"
 
-# --- vmtb-deployer: what GitHub Actions may do ---
-for ROLE in roles/run.admin roles/iam.serviceAccountUser roles/artifactregistry.writer roles/cloudbuild.builds.builder roles/storage.objectAdmin roles/secretmanager.viewer; do
+# deployer SA: what GitHub Actions may do
+for ROLE in roles/run.admin roles/iam.serviceAccountUser roles/artifactregistry.writer \
+            roles/cloudbuild.builds.builder roles/storage.objectAdmin roles/secretmanager.viewer; do
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:vmtb-deployer@$PROJECT_ID.iam.gserviceaccount.com" --role="$ROLE"
 done
 ```
 
-### 1.6 Secrets (Secret Manager)
-
-Collect these values first:
-
-| Secret Manager name | Value |
-|---|---|
-| `supabase-url` | `https://xxxx.supabase.co` |
-| `supabase-service-role-key` | service role key (**secret**, never the anon key) |
-| `llm-api-key` | Mistral API key (§4) |
-| `pubsub-push-token` | any long random string you invent |
+### 2.4 Secrets (Secret Manager)
 
 ```bash
-printf '%s' 'https://xxxx.supabase.co' | gcloud secrets create supabase-url --data-file=- --replication-policy=automatic
-printf '%s' 'SUPABASE_SERVICE_ROLE_KEY' | gcloud secrets create supabase-service-role-key --data-file=- --replication-policy=automatic
-printf '%s' 'MISTRAL_API_KEY'          | gcloud secrets create llm-api-key --data-file=- --replication-policy=automatic
-openssl rand -hex 24 | gcloud secrets create pubsub-push-token --data-file=- --replication-policy=automatic
+printf '%s' 'https://YOUR-PROJECT.supabase.co' | \
+  gcloud secrets create supabase-url --data-file=- --replication-policy=automatic
+printf '%s' 'PASTE_SERVICE_ROLE_KEY' | \
+  gcloud secrets create supabase-service-role-key --data-file=- --replication-policy=automatic
+openssl rand -hex 24 | \
+  gcloud secrets create pubsub-push-token --data-file=- --replication-policy=automatic
+# llm-api-key is created in §7 (Mistral) — the worker deploy expects it,
+# so either do §7 first or create an empty placeholder now:
+printf '%s' 'placeholder' | \
+  gcloud secrets create llm-api-key --data-file=- --replication-policy=automatic
 
-# Only vmtb-services reads them at runtime:
 for SECRET in supabase-url supabase-service-role-key llm-api-key pubsub-push-token; do
   gcloud secrets add-iam-policy-binding "$SECRET" \
     --member="serviceAccount:vmtb-services@$PROJECT_ID.iam.gserviceaccount.com" \
@@ -156,16 +137,15 @@ for SECRET in supabase-url supabase-service-role-key llm-api-key pubsub-push-tok
 done
 ```
 
-### 1.7 GPU quota (do this early — approval takes time)
+### 2.5 GPU quota (request early — approval can take days)
 
-Console → **IAM & Admin → Quotas** → filter: `GPUS_ALL_MODEL_ZONES` (and
-`NVIDIA_L4_GPUS`) in `asia-southeast1` → request an increase to **1**.
-Without quota the STT deploy fails with a GPU quota error.
+Console → **IAM & Admin → Quotas & System Limits** → filter `NVIDIA_L4_GPUS`,
+region `asia-southeast1` → **Edit** → request **1**.
+Without this the stt-service deploy fails.
 
-### 1.8 GitHub Actions authentication (Workload Identity Federation)
+### 2.6 GitHub Actions authentication (Workload Identity Federation)
 
-No long-lived keys stored in GitHub — GitHub's OIDC token is exchanged for
-GCP credentials.
+No keys stored in GitHub — OIDC token exchange:
 
 ```bash
 PROJECT_NUMBER=YOUR_PROJECT_NUMBER
@@ -186,80 +166,70 @@ gcloud iam service-accounts add-iam-policy-binding \
   --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github-pool/attribute.repository/${GH_REPO}"
 ```
 
-Now add three secrets in GitHub: **Settings → Secrets and variables →
-Actions → New repository secret**
+Add three secrets in GitHub → **Settings → Secrets and variables → Actions**:
 
 | Name | Value |
 |---|---|
 | `GCP_PROJECT_ID` | your project id |
-| `GCP_WIF_PROVIDER` | `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider` |
+| `GCP_WIF_PROVIDER` | `projects/YOUR_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider` |
 | `GCP_DEPLOY_SA` | `vmtb-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com` |
 
 ---
 
-## 2. Supabase schema
+## 3. Supabase schema (one-time)
 
-Apply `main/supabase/migrations/20260820_meeting_transcripts.sql` once:
-Supabase Dashboard → **SQL Editor** → paste the file contents → **Run**.
-This creates `meeting_transcripts`, `meeting_transcript_segments`, the state
-RPCs, RLS policies and adds segments to the realtime publication.
+Supabase Dashboard → **SQL Editor** → paste all of
+`main/supabase/migrations/20260820_meeting_transcripts.sql` → **Run**.
+Creates `meeting_transcripts`, `meeting_transcript_segments`, the state RPCs,
+RLS policies and realtime publication.
 
 ---
 
-## 3. Deploy the services (GitHub buttons)
+## 4. Deploy the four backend services (GitHub buttons)
 
-Push this branch to GitHub, then open the **Actions** tab. You will find one
-workflow per service — click it, press **Run workflow**, keep the default
-image tag. Deploy in this order (later ones depend on earlier ones):
+GitHub → **Actions** tab → pick a workflow → **Run workflow** → keep defaults.
+Deploy strictly in this order:
 
-1. **Deploy stt-service** — slowest first build (~15–25 min: CUDA wheels +
-   baked Whisper `medium` model).
-2. **Deploy opus-transcriber-proxy** — auto-wires `STT_WS_URL` from step 1.
-3. **Deploy transcript-worker** — wires Mistral + secrets.
-4. **Deploy jitsi-activation-backend** — wires VM + both services by name.
+1. **Deploy stt-service** — first build takes ~15–25 min (CUDA wheels +
+   Whisper `medium` model baked into the image).
+2. **Deploy opus-transcriber-proxy** — auto-fetches the STT URL.
+3. **Deploy transcript-worker** — wires secrets + creates the Pub/Sub push
+   subscription automatically.
+4. **Deploy jitsi-activation-backend**.
 
-Each workflow prints the service URL in its log (also visible via
-`gcloud run services list`). Note down:
+Then collect the URLs you'll need later:
 
 ```bash
 gcloud run services list --project YOUR_PROJECT_ID
-```
-
-### 3.4 Wire Pub/Sub push to the worker (one-time, after step 3)
-
-```bash
-WORKER_URL=$(gcloud run services describe transcript-worker \
+# save these two:
+PROXY_URL=$(gcloud run services describe opus-transcriber-proxy \
   --project YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
-PUSH_TOKEN=$(gcloud secrets versions access latest --secret=pubsub-push-token)
-
-gcloud pubsub subscriptions create meeting-transcripts-worker \
-  --topic=meeting-transcripts \
-  --push-endpoint="${WORKER_URL}/pubsub/push" \
-  --push-auth-service-account="vmtb-services@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-  --push-auth-token="$PUSH_TOKEN" \
-  --ack-deadline=60
+ACT_URL=$(gcloud run services describe jitsi-activation-backend \
+  --project YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
+echo "PROXY=$PROXY_URL"; echo "ACT=$ACT_URL"
 ```
 
-The `push-auth-service-account` gives Pub/Sub an ID token so the worker's
-`--no-allow-unauthenticated` policy accepts the delivery; the random
-`push-auth-token` is a second layer checked by the worker itself.
+> **Write down `PROXY_URL`** — you need it in §6.5 (Jicofo config).
+> **Write down `ACT_URL`** — you need it in §8 (frontends).
 
 ---
 
-## 4. Mistral setup (Minutes-of-Meeting)
+## 5. Mistral setup (Minutes-of-Meeting)
 
-1. Sign up at <https://console.mistral.ai/> → **API Keys** → create key.
-2. Store it: `gcloud secrets versions add llm-api-key --data-file=- <<< 'YOUR_KEY'`
-   (or re-run the §1.6 command with the real key before first deploy).
-3. The worker is already configured (see `.github/workflows/deploy-transcript-worker.yml`):
-   - `LLM_PROVIDER=mistral` (any value except `none` enables MoM)
-   - `LLM_BASE_URL=https://api.mistral.ai/v1` (OpenAI-compatible)
-   - `LLM_MODEL=mistral-small-latest` (cheap + good; use
-     `mistral-large-latest` for higher quality)
-4. Free tier rate limits are handled: `generateMom` retries 429/5xx twice
-   with backoff (`transcript-worker/src/llm.ts`).
+1. <https://console.mistral.ai/> → **API Keys** → *Create new key*.
+2. Store it (replaces the placeholder from §2.4):
+   ```bash
+   printf '%s' 'YOUR_REAL_MISTRAL_KEY' | \
+     gcloud secrets versions add llm-api-key --data-file=-
+   ```
+3. Redeploy **transcript-worker** via its Action button so the new secret
+   version is picked up (or just wait — secret versions are resolved at
+   container start, so a redeploy guarantees it).
+4. Config already set in the workflow: `LLM_BASE_URL=https://api.mistral.ai/v1`,
+   `LLM_MODEL=mistral-small-latest`. Transient 429/5xx errors are retried
+   automatically (`transcript-worker/src/llm.ts`).
 
-Test MoM generation standalone:
+Quick sanity check of your key:
 
 ```bash
 curl https://api.mistral.ai/v1/chat/completions \
@@ -270,108 +240,244 @@ curl https://api.mistral.ai/v1/chat/completions \
 
 ---
 
-## 5. Jitsi VM (`jitsi-vm`)
+## 6. Jitsi VM from scratch (`meet.vmtb.in`)
 
-The VM must exist in `asia-south1-c` (the activation backend starts/stops it
-by name). If your old VM still exists, only do §5.2. If you scrapped it,
-create a fresh one first (Ubuntu 22.04, e2-standard-4, ports 80/443/10000),
-install Jitsi Meet following the official quickstart
-(<https://jitsi.github.io/handbook/docs/devops-guide/devops-guide-quickstart>),
-point DNS `meet.vmtb.in` at its IP, and install TLS via
-`/usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh`.
+This creates the VM that runs JVB (media), Prosody (XMPP), Jicofo (conference
+logic) and nginx. Nothing else in the pipeline works without it.
 
-### 5.1 Enable transcription (bridge-based)
+### 6.1 Firewall rules (one-time)
 
-Follow `docs/JITSI_INTEGRATION.md`. Summary of the three edits on the VM:
+```bash
+gcloud compute firewall-rules create allow-jitsi-http \
+  --allow=tcp:80 --source-ranges=0.0.0.0/0
+gcloud compute firewall-rules create allow-jitsi-https \
+  --allow=tcp:443 --source-ranges=0.0.0.0/0
+gcloud compute firewall-rules create allow-jitsi-media \
+  --allow=udp:10000 --source-ranges=0.0.0.0/0
+```
+
+(SSH/tcp:22 is already open via the default network's `default-allow-ssh`.)
+
+### 6.2 Create the VM
+
+```bash
+gcloud compute instances create jitsi-vm \
+  --zone=asia-south1-c \
+  --machine-type=e2-standard-4 \
+  --image-family=ubuntu-2204-lts \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=20GB
+```
+
+`e2-standard-4` (4 vCPU / 16 GB) comfortably hosts small tumor-board meetings.
+For pure cost saving with ≤5 participants you can drop to `e2-standard-2`.
+
+### 6.3 DNS (do this NOW — Let's Encrypt needs it)
+
+At your DNS provider for `vmtb.in`, create:
+
+```
+Type: A   Host: meet   Value: <VM_EXTERNAL_IP>   TTL: 300
+```
+
+Get the IP with `gcloud compute instances describe jitsi-vm \
+--zone=asia-south1-c --format='value(networkInterfaces[0].accessConfigs[0].natIP)'`.
+Wait until this resolves before continuing:
+
+```bash
+dig +short meet.vmtb.in   # must print the VM IP
+```
+
+### 6.4 Install Jitsi Meet on the VM
+
+```bash
+gcloud compute ssh jitsi-vm --zone=asia-south1-c
+```
+
+Then on the VM:
+
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo hostnamectl set-hostname meet.vmtb.in
+echo "127.0.0.1 meet.vmtb.in" | sudo tee -a /etc/hosts
+
+curl https://download.jitsi.org/jitsi-key.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/jitsi-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/jitsi-keyring.gpg] https://download.jitsi.org/ stable/" | \
+  sudo tee /etc/apt/sources.list.d/jitsi-stable.list
+sudo apt update
+sudo apt install -y jitsi-meet
+```
+
+During installation it prompts twice:
+- **FQDN**: type exactly `meet.vmtb.in`
+- **Certificate**: choose *"Generate a new self-signed certificate"* (we
+  replace it with Let's Encrypt next)
+
+Now get a real TLS certificate:
+
+```bash
+sudo /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
+# enter your email when prompted
+```
+
+Open `https://meet.vmtb.in` in a browser — you should see the Jitsi welcome
+page. Meetings already work at this point; transcription comes next.
+
+### 6.5 Wire transcription to your proxy ← **the important part**
+
+Four edits on the VM. Replace `<PROXY_URL>` with the value saved in §4
+(e.g. `https://opus-transcriber-proxy-xxxxx-ey.a.run.app`).
+
+**(a) Force-enable transcription on every room (Prosody module)**
+
+```bash
+sudo tee /usr/share/jitsi-meet/prosody-plugins/mod_force_async_transcription.lua > /dev/null <<'EOF'
+-- Forces asyncTranscription=true on every room's metadata.
+local util = module:require 'util';
+local is_healthcheck_room = util.is_healthcheck_room;
+
+module:hook('muc-room-created', function(event)
+    local room = event.room;
+    if is_healthcheck_room(room.jid) then return; end
+    if not room.jitsiMetadata then room.jitsiMetadata = {}; end
+    room.jitsiMetadata.asyncTranscription = true;
+    module:log('info', 'Forced asyncTranscription=true for %s', room.jid);
+end, -2); -- after mod_room_metadata_component (-1)
+EOF
+```
+
+**(b) Enable the module on the conference component**
+
+Edit `/etc/prosody/conf.avail/meet.vmtb.in.cfg.lua`. Find the block starting
+with `Component "conference.meet.vmtb.in" "muc"` and make sure its
+`modules_enabled` list contains both entries:
 
 ```lua
--- /etc/prosody/conf.avail/<your-vhost>.cfg.lua  (inside the MUC component)
-muc_room_metadata = {
-    ["org.jitsi.meet"] = { transcription = { enabled = true } },
-}
+Component "conference.meet.vmtb.in" "muc"
+    ...
+    modules_enabled = {
+        "muc_meeting_id";           -- usually already present
+        "force_async_transcription"; -- ADD THIS LINE
+        ...
+    }
 ```
 
+**(c) Point Jicofo at the proxy**
+
+Edit `/etc/jicofo/jicofo.conf` — add a `transcription` block inside the
+top-level `jicofo { ... }` section:
+
 ```
-# /etc/jicofo/jicofo.conf
 jicofo {
+  // ... existing config stays ...
+
   transcription {
-    url-template = "wss://PROXY_PUBLIC_URL/transcribe?sessionId={{MEETING_ID}}&sendBack=true"
+    url-template = "wss://<PROXY_URL>/transcribe?sessionId={{MEETING_ID}}&sendBack=true"
+    ping {
+      enabled = true
+      interval = 10 seconds
+      timeout = 3 seconds
+    }
   }
 }
 ```
 
+**(d) Enable the toggle in the client**
+
+Edit `/etc/jitsi/meet/meet.vmtb.in-config.js` and add:
+
 ```js
-// /etc/jitsi/meet/meet.vmtb.in-config.js
-transcription: { enabled: true },
+transcription: {
+    enabled: true,
+},
 ```
 
-Then `sudo systemctl restart prosody jicofo nginx`. Replace
-`PROXY_PUBLIC_URL` with the proxy URL from §3.
-
-### 5.2 Verify the activation backend can control the VM
+**(e) Restart and verify**
 
 ```bash
-ACT_URL=$(gcloud run services describe jitsi-activation-backend \
-  --project YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
-
-curl -s "$ACT_URL/status" | python3 -m json.tool   # read-only view
-curl -s -X POST "$ACT_URL/start-jitsi"             # repeat until all "ready"
-curl -s -X POST "$ACT_URL/stop-jitsi"              # tear everything down
+sudo systemctl restart prosody jicofo
+sudo systemctl status prosody jicofo nginx   # all should be active
 ```
 
-`/start-jitsi` returns `{"status":"already_running"}` only when the VM is
-RUNNING **and** both Cloud Run services answer their health endpoints.
+Reference: <https://jitsi.github.io/handbook/docs/devops-guide/transcription/>
+
+### 6.6 Check the activation backend can control this VM
+
+From your laptop:
+
+```bash
+ACT_URL=<your activation backend URL>
+curl -s "$ACT_URL/status" | python3 -m json.tool
+# expect: jvb TERMINATED, stt cold, proxy cold
+
+curl -s -X POST "$ACT_URL/start-jitsi"
+# repeat every few seconds until ALL components say "ready"
+# then tear back down:
+curl -s -X POST "$ACT_URL/stop-jitsi"
+```
+
+If `jvb` shows `error`, re-check §2.3 IAM bindings and the activation
+backend's Cloud Run logs.
 
 ---
 
-## 6. Frontends
+## 7. Frontends (URL linking)
 
-### 6.1 `main/` on Render
+### 7.1 `main/` on Render
 
-Set environment variables (Render → service → Environment):
+Render dashboard → your service → **Environment**, then redeploy:
 
 | Var | Value |
 |---|---|
 | `VITE_SUPABASE_URL` | your Supabase URL |
 | `VITE_SUPABASE_ANON_KEY` | anon key |
-| `VITE_JITSI_BACKEND_URL` | activation backend URL (from §5.2) |
-| `VITE_SERVER_LOADER_URL` | `https://server.vmtb.in` (jitsi-frontend) |
+| `VITE_JITSI_BACKEND_URL` | `<ACT_URL>` from §4 |
+| `VITE_SERVER_LOADER_URL` | `https://server.vmtb.in` |
 
-Redeploy after changing env vars.
+### 7.2 `jitsi-frontend/` on Vercel (`server.vmtb.in`)
 
-### 6.2 `jitsi-frontend/` on Vercel (`server.vmtb.in`)
+Vercel project → **Settings → Environment Variables**, then redeploy:
 
 | Var | Value |
 |---|---|
-| `VITE_JITSI_BACKEND_URL` | activation backend URL |
+| `VITE_JITSI_BACKEND_URL` | `<ACT_URL>` from §4 |
 | `VITE_JITSI_DOMAIN` | `meet.vmtb.in` |
 | `VITE_MAIN_APP_URL` | your main app URL |
 | `VITE_SUPABASE_URL` | your Supabase URL |
 | `VITE_SUPABASE_ANON_KEY` | anon key |
 
+> `VITE_*` vars are baked at **build time** — changing them requires a
+> redeploy, they never apply retroactively.
+
 ---
 
-## 7. End-to-end test
+## 8. End-to-end test
 
-1. **Cold check**: `curl $ACT_URL/status` → jvb `TERMINATED`, stt/proxy `cold`.
-2. **Start a meeting**: main app → MTB → *Meeting* → *Start Meeting*. The
-   loader page polls `/start-jitsi`; expect **1–3 minutes** (VM boot + GPU
-   allocation + model load) before the room opens.
-3. **Transcribe**: in the meeting, enable *Record/Transcribe* from the
-   reactions/menu, speak. Captions should appear (`sendBack=true`).
-4. **Segments land**: Supabase → Table Editor →
-   `meeting_transcript_segments` shows FINAL rows for the meeting id.
-5. **End the meeting**: leave/end for all participants. Within ~a minute the
-   worker processes the `meeting.completed` event:
+Do this exactly once, in order, and note anything that breaks.
+
+1. **Cold state**
+   `curl -s $ACT_URL/status | python3 -m json.tool`
+   → jvb `TERMINATED`, stt `cold`, proxy `cold`.
+2. **Start a meeting** — main app → MTB → *Meeting* → *Start Meeting*.
+   The loader polls `/start-jitsi`; expect **1–3 min** (VM boot + GPU alloc +
+   model load) before the room opens.
+3. **Talk** — join from a second device/tab if possible. With
+   `force_async_transcription` installed, JVB should connect to the proxy
+   automatically. Captions appear because `sendBack=true`.
+   Check: proxy logs (Cloud Run → opus-transcriber-proxy → Logs) show
+   `transcription session opened`.
+4. **Segments land** — Supabase → Table Editor →
+   `meeting_transcript_segments`: FINAL rows appear within seconds of speech.
+5. **End the meeting** — leave/end for everyone. Within ~1 min:
    - `meeting_transcripts.status` → `COMPLETED`
-   - `gs://vmtb-transcripts/meetings/<meeting_id>/transcript/transcript-v1.{json,txt}`
-   - `minutes_of_meeting` column populated by Mistral (JSON with summary /
-     decisions / action items).
-6. **Tear down**: `curl -X POST $ACT_URL/stop-jitsi` → confirm `/status`
-   shows everything stopped/cold. **Do this after every test session** —
-   the warm GPU bills ~$0.80/hr.
+   - `gs://vmtb-transcripts/meetings/<meeting_id>/transcript/transcript-v1.{json,txt}` exist
+   - `minutes_of_meeting` column filled with Mistral JSON
+     (summary / decisions / action_items).
+6. **Tear down**
+   `curl -X POST $ACT_URL/stop-jitsi` then confirm `/status` shows all
+   stopped/cold. **Never skip this** — the warm GPU bills ~$0.80/hr.
 
-Smoke-test without a real meeting (dummy provider, no GPU needed):
+Pipeline smoke test without a real meeting (dummy provider, no GPU):
 
 ```bash
 node -e '
@@ -384,33 +490,34 @@ ws.on("message", (m) => console.log(m.toString()));
 
 ---
 
-## 8. Keeping costs near zero between meetings
+## 9. Keeping costs near zero between meetings
 
-- Everything deploys with `--min-instances 0`: idle Cloud Run services are free.
-- The GPU instance only exists while woken (`min-instances 0→1` by
-  `/start-jitsi`) — it bills roughly **$0.70–1.00/hr** while warm.
-- The Jitsi VM bills while RUNNING (~e2-standard-4 price).
-- **Always stop after testing**: `curl -X POST $ACT_URL/stop-jitsi`.
-- Safety net — auto-stop every night (Cloud Scheduler):
+- All Cloud Run services run `--min-instances 0` → free while idle.
+- Woken GPU ≈ **$0.70–1.00/hr**; VM ≈ e2-standard-4 hourly rate while RUNNING.
+- Always stop after testing: `curl -X POST $ACT_URL/stop-jitsi`.
+- Safety net — auto-stop every night at midnight IST:
   ```bash
   gcloud scheduler jobs create http vmtb-nightly-stop \
-    --schedule="30 18 * * *" --time-zone="Asia/Kolkata" \  # 00:00 IST
+    --location=asia-south1 \
+    --schedule="30 18 * * *" --time-zone="Asia/Kolkata" \
     --uri="$ACT_URL/stop-jitsi" --http-method=POST
   ```
+  (enable Cloud Scheduler API if prompted)
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
-| STT deploy fails with GPU/quota error | §1.7 quota not granted yet, or wrong region (must be `asia-southeast1`) |
-| Meeting stuck on loader ("Server starting…") | `curl $ACT_URL/status` — see which component isn't ready; check Cloud Run logs of that service |
-| `/start-jitsi` components show `error` | activation backend lacks IAM (re-run §1.5 bindings); check its Cloud Run logs |
-| Proxy logs show STT connect failures (403) | `STT_USE_ID_TOKEN=true` missing on proxy, or `vmtb-services` lacks `roles/run.invoker` |
-| No captions in meeting | Jicofo `url-template` wrong / Prosody metadata missing / transcription toggle off (§5.1) |
-| Segments never appear in Supabase | proxy `PERSISTENCE=supabase` + secrets correct? Check proxy logs for store errors |
-| Worker never runs | push subscription missing/wrong URL/token (§3.4); check `meeting_transcripts.status` stays `PENDING` |
-| Worker marks meeting FAILED with LLM error | invalid/expired Mistral key in `llm-api-key` secret; fix key, redeploy worker, re-trigger by replaying the Pub/Sub message |
-| WebSocket drops at exactly 60 min | Cloud Run hard request timeout cap; the proxy auto-reconnects to STT, JVB reconnects to proxy — acceptable for MVP |
-| CORS error in browser console | add the frontend origin to `CORS_ORIGINS` env of the activation backend and redeploy |
+| STT deploy fails: GPU quota error | §2.5 quota not granted yet, or wrong region |
+| Meeting stuck on loader ("Server starting…") | `curl $ACT_URL/status` → see which component isn't ready; check that service's Cloud Run logs |
+| `/start-jitsi` components show `error` | IAM bindings from §2.3 missing; check activation backend logs |
+| Proxy logs: STT connect failures (403) | `STT_USE_ID_TOKEN=true` missing on proxy, or `vmtb-services` lacks `roles/run.invoker` |
+| No captions / nothing in proxy logs | §6.5 wiring wrong: jicofo.conf template, prosody module not loaded (`systemctl status prosody`), or client toggle off |
+| Segments never appear in Supabase | proxy secrets wrong (`supabase-url` / `supabase-service-role-key`); check proxy logs for store errors |
+| Worker never runs; status stuck PENDING | push subscription broken — rerun the transcript-worker workflow (it repairs it) |
+| Meeting FAILED with LLM error | bad/expired Mistral key → fix `llm-api-key` secret, redeploy worker |
+| WebSocket drops at exactly 60 min | Cloud Run hard cap; proxy/STT reconnect automatically — acceptable for MVP |
+| CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend, redeploy |
+| Let's Encrypt fails on VM | DNS not propagated yet (§6.3) or port 80 blocked (§6.1) |
