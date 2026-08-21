@@ -1,4 +1,7 @@
 fastapi
 uvicorn
 google-cloud-compute
+google-cloud-run
 google-auth
+httpx
+protobuf

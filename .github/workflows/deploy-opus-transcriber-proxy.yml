@@ -1,0 +1,92 @@
+# Deploy opus-transcriber-proxy (JVB -> STT WebSocket proxy) to Cloud Run.
+#
+# Run manually from the GitHub "Actions" tab. Deploy stt-service FIRST so the
+# STT WebSocket URL can be wired in automatically.
+#
+# Required repository secrets: GCP_PROJECT_ID, GCP_WIF_PROVIDER, GCP_DEPLOY_SA
+# See docs/DEPLOYMENT.md.
+
+name: Deploy opus-transcriber-proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag (default: git short sha)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-opus-transcriber-proxy
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: asia-southeast1
+  REPO: vmtb-services
+  SERVICE: opus-transcriber-proxy
+  RUNTIME_SA: vmtb-services
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build image (Cloud Build)
+        run: |
+          gcloud builds submit "$SERVICE" \
+            --project "$PROJECT_ID" \
+            --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}"
+
+      # The JVB VM connects to this service over plain WSS and cannot obtain
+      # Cloud Run ID tokens, so the service must allow unauthenticated calls.
+      # Abuse surface is limited by the sessionId validation + length cap.
+      - name: Deploy to Cloud Run
+        run: |
+          STT_URL=$(gcloud run services describe stt-service \
+            --project "$PROJECT_ID" --region "$REGION" \
+            --format 'value(status.url)' 2>/dev/null || true)
+          if [ -z "$STT_URL" ]; then
+            echo "::warning::stt-service not found in $REGION - deploy it first; continuing with empty STT_WS_URL"
+          fi
+          STT_WS_URL="${STT_URL/https:/wss:}/client/ws/speech"
+
+          gcloud run deploy "$SERVICE" \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --image "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}" \
+            --service-account "$RUNTIME_SA@$PROJECT_ID.iam.gserviceaccount.com" \
+            --allow-unauthenticated \
+            --min-instances 0 \
+            --max-instances 10 \
+            --timeout 3600 \
+            --set-env-vars "PROVIDER=self-hosted,STT_SAMPLE_RATE=16000,STT_CHUNK_MS=60,STT_USE_ID_TOKEN=true,GCP_PROJECT_ID=$PROJECT_ID,PUBSUB_TOPIC=meeting-transcripts,STT_WS_URL=$STT_WS_URL" \
+            --set-secrets "SUPABASE_URL=supabase-url:latest,SUPABASE_SERVICE_ROLE_KEY=supabase-service-role-key:latest"
+
+      - name: Show service URL
+        run: |
+          gcloud run services describe "$SERVICE" \
+            --project "$PROJECT_ID" --region "$REGION" \
+            --format 'value(status.url)'
