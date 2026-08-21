@@ -1,0 +1,36 @@
+{
+  "name": "opus-transcriber-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "JVB -> STT WebSocket transcription proxy. Accepts the Jitsi bridge-based transcription protocol, decodes participant-tagged Opus audio, streams it to a self-hosted STT backend and persists final transcript segments to Supabase.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "simulate:jvb": "tsx scripts/simulate-jvb.ts"
+  },
+  "dependencies": {
+    "@google-cloud/pubsub": "^4.9.0",
+    "@supabase/supabase-js": "^2.47.10",
+    "dotenv": "^16.4.7",
+    "google-auth-library": "^9.15.1",
+    "opus-decoder": "^0.7.11",
+    "pino": "^9.5.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "pino-pretty": "^13.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
