@@ -72,6 +72,8 @@ Manual links: #1, #2, #3, #9. Everything else self-wires during deploys.
   ```
 - Owner/editor rights on the GCP project (for one-time IAM setup).
 - Your GitHub repo pushed and Actions enabled, e.g. `harishbabu2007/vMTB-Veritas`.
+  All work currently lives on the `feature/codebase-reorg` branch — §7
+  configures both frontends to build from it.
 - A [Vercel](https://vercel.com) account (sign in with GitHub).
 - A [Render](https://render.com) account (sign in with GitHub).
 - A [Mistral](https://console.mistral.ai/) account (free tier OK).
@@ -200,10 +202,10 @@ GitHub → **Settings → Secrets and variables → Actions → New repository s
 | `GCP_PROJECT_ID` | your project id | §2 |
 | `GCP_WIF_PROVIDER` | `projects/YOUR_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider` | §2.6 |
 | `GCP_DEPLOY_SA` | `vmtb-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com` | §2.3 |
-| `RENDER_DEPLOY_HOOK` | Render deploy-hook URL | §7.1 step 5 |
-| `VERCEL_TOKEN` | Vercel personal access token | §7.2 step 4 |
-| `VERCEL_ORG_ID` | Vercel org/team id | §7.2 step 4 |
-| `VERCEL_PROJECT_ID` | Vercel project id | §7.2 step 4 |
+| `RENDER_DEPLOY_HOOK` | Render deploy-hook URL | §7.1 step C |
+| `VERCEL_TOKEN` | Vercel personal access token | §7.2 step D |
+| `VERCEL_ORG_ID` | Vercel org/team id | §7.2 step D |
+| `VERCEL_PROJECT_ID` | Vercel project id | §7.2 step D |
 
 (GCP secrets can be added now; the Render/Vercel ones after §7 creates those
 projects.)
@@ -469,78 +471,168 @@ Do this only after the app works to your satisfaction. Summary:
 
 ## 7. Frontends from scratch (Render + Vercel)
 
-Both are static Vite builds. **Order matters** because their URLs point at
-each other: create Render first (its URL exists immediately), then Vercel,
-then loop back to Render once with the Vercel URL.
+Both frontends are static Vite builds served by their platforms' CDNs.
 
-### 7.1 Create the main app on Render
+> **Branch warning:** everything we built lives on `feature/codebase-reorg`.
+> Both platforms default to your repo's *default* branch (`main`) — make sure
+> you point them at `feature/codebase-reorg` (steps below), or merge to `main`
+> first. Switch them back to `main` after you eventually merge.
 
-1. <https://dashboard.render.com> → **New +** → **Static Site** → connect
-   your GitHub repo (grant access when prompted).
-2. Settings:
-   - **Name**: `vmtb-main` → URL becomes `https://vmtb-main.onrender.com`
-   - **Root Directory**: `main`
-   - **Build Command**: `npm ci && npm run build`
-   - **Publish Directory**: `dist`
-     *(if the first deploy fails complaining about a missing `dist`, change
-     this to `main/dist`)*
-3. **Environment Variables** (Add more → each row):
-   - `VITE_SUPABASE_URL` = your Supabase URL
-   - `VITE_SUPABASE_ANON_KEY` = anon key
-   - `VITE_JITSI_BACKEND_URL` = `<ACT_URL>` from §4
-   - `VITE_SERVER_LOADER_URL` = *(leave empty for now — filled in §7.3)*
-4. **SPA routing (required!)**: scroll to *Redirects/Rewrites* and add:
-   - Rule: `/*` → Rewrite → `/index.html`
-   Without this, refreshing any page other than home shows 404.
-5. Click **Create Static Site**. Wait for the first deploy to finish.
-6. Grab the deploy hook: service page → **Settings** → **Deploy Hook** →
-   copy the URL → add it as GitHub secret `RENDER_DEPLOY_HOOK` (§2.7).
+**Order matters** because the two URLs point at each other:
 
-> Note the site URL `https://vmtb-main.onrender.com` — needed in §7.2.
+```
+1. Create Render site      → its URL exists immediately (e.g. vmtb-main.onrender.com)
+2. Create Vercel project   → uses the Render URL as VITE_MAIN_APP_URL
+3. Loop back to Render     → set VITE_SERVER_LOADER_URL to the Vercel URL, redeploy
+```
 
-### 7.2 Create jitsi-frontend on Vercel
+You will need ready: `<ACT_URL>` (§4), `<VM_IP>` (§6.2), Supabase URL + anon key.
 
-1. <https://vercel.com/new> → **Import** your GitHub repo.
-2. Configure:
-   - **Framework Preset**: Vite
-   - **Root Directory**: `jitsi-frontend` (Edit → select)
-   - Build command / output auto-detect from Vite (`npm run build` / `dist`)
-3. **Environment Variables** (Production):
-   - `VITE_JITSI_BACKEND_URL` = `<ACT_URL>` from §4
-   - `VITE_JITSI_DOMAIN` = `<VM_IP>` from §6.2 (switch to `meet.vmtb.in`
-     later per §6.7)
-   - `VITE_MAIN_APP_URL` = `https://vmtb-main.onrender.com` (from §7.1)
-   - `VITE_SUPABASE_URL` = your Supabase URL
-   - `VITE_SUPABASE_ANON_KEY` = anon key
-4. Click **Deploy**. When done, note your production URL
-   (e.g. `https://vmtb-jitsi.vercel.app` — visible at the top of the project).
-5. Get the CI/CD credentials:
-   - **Org ID + Project ID**: project → *Settings* → *General* →
-     "Vercel Organization ID" and "Vercel Project ID"
-     (or run `npx vercel link` inside `jitsi-frontend/` locally and open
-     `.vercel/project.json`)
-   - **Token**: <https://vercel.com/account/settings/tokens> → *Create*
-6. Add three GitHub secrets (§2.7): `VERCEL_TOKEN`, `VERCEL_ORG_ID`,
-   `VERCEL_PROJECT_ID`.
+---
 
-From now on, **Actions → Deploy jitsi-frontend (Vercel)** rebuilds and ships
-it. (Vercel's git-integration also auto-deploys on push; disable it under
-Settings → Git if you want button-only deploys.)
+### 7.1 Manual: main app on Render
+
+**A. Account & access**
+
+1. Go to <https://dashboard.render.com> → **Get Started** / sign in **with
+   GitHub** (recommended — avoids extra password setup).
+2. If asked, install the **Render GitHub App** and grant it access to your
+   `vMTB-Veritas` repository (you can scope it to just this repo).
+
+**B. Create the service**
+
+3. Dashboard top-right: **New +** → **Static Site**.
+4. Pick your `vMTB-Veritas` repository from the list → **Connect**.
+5. Fill the creation form exactly:
+
+   | Field | Value | Notes |
+   |---|---|---|
+   | Name | `vmtb-main` | URL becomes `https://vmtb-main.onrender.com` |
+   | Project | *(leave empty)* | optional grouping |
+   | Language/Framework | leave as detected / "Static Site" | |
+   | Branch | `feature/codebase-reorg` | ← **not** `main` (see branch warning) |
+   | Root Directory *(under Advanced)* | `main` | all paths below become relative to this |
+   | Build Command | `npm ci && npm run build` | |
+   | Publish Directory | `dist` | relative to Root Directory, so `main/dist` |
+
+6. **Environment Variables** — click *Add more* for each row:
+
+   | Name | Value |
+   |---|---|
+   | `VITE_SUPABASE_URL` | your Supabase URL (`https://xxxx.supabase.co`) |
+   | `VITE_SUPABASE_ANON_KEY` | anon key (safe for browsers) |
+   | `VITE_JITSI_BACKEND_URL` | `<ACT_URL>` from §4 |
+   | `VITE_SERVER_LOADER_URL` | *(skip for now — added in §7.3)* |
+
+   > These are **build-time** variables: changing them later requires a
+   > redeploy (our Action button does that).
+
+7. **SPA routing rule (required!)** — still in the form, find
+   *Redirects/Rewrites* → *Add rule*:
+   - Source: `/*`
+   - Destination: `/index.html`
+   - Action: **Rewrite** (NOT Redirect)
+   
+   Without this, refreshing any route other than `/` (e.g. `/my-cases`)
+   returns 404.
+
+8. Click **Create Static Site**. Watch the *Events* tab — first build takes
+   ~2–4 min. When it says *Live*, open `https://vmtb-main.onrender.com`:
+   you should see the vMTB login page. Log in with a real account to confirm
+   Supabase connectivity.
+
+**C. Wire up CI/CD**
+
+9. Service page → **Settings** → scroll to **Deploy Hook** → copy the URL
+   (looks like `https://api.render.com/deploy/srv-...?key=...`).
+10. Add it as the GitHub secret `RENDER_DEPLOY_HOOK` (§2.7).
+
+    From now on, **Actions → Deploy main app (Render)** triggers a fresh
+    build. (Render also auto-deploys on every push to the branch by default;
+    turn that off under Settings → Build & Deploy → Auto-Deploy if you want
+    button-only.)
+
+---
+
+### 7.2 Manual: jitsi-frontend on Vercel
+
+**A. Account & access**
+
+1. Go to <https://vercel.com> → **Sign Up / Log in with GitHub**.
+2. If asked, install the **Vercel GitHub App** for your repository.
+
+**B. Create the project**
+
+3. <https://vercel.com/new> → find `vMTB-Veritas` in the *Import Git
+   Repository* list → **Import**.
+4. On the *Configure Project* screen:
+
+   | Field | Value | Notes |
+   |---|---|---|
+   | Project Name | `vmtb-jitsi` | URL becomes `https://vmtb-jitsi.vercel.app` |
+   | Framework Preset | Vite | usually auto-detected |
+   | Root Directory | `jitsi-frontend` | click **Edit** next to Root Directory → select → Continue |
+   | Build Command / Output | leave as detected (`npm run build` / `dist`) | |
+
+5. Expand **Environment Variables** and add each row (keep *Environment* =
+   Production, Preview optional):
+
+   | Name | Value |
+   |---|---|
+   | `VITE_JITSI_BACKEND_URL` | `<ACT_URL>` from §4 |
+   | `VITE_JITSI_DOMAIN` | `<VM_IP>` from §6.2 *(switch to `meet.vmtb.in` later, §6.7)* |
+   | `VITE_MAIN_APP_URL` | `https://vmtb-main.onrender.com` (from §7.1) |
+   | `VITE_SUPABASE_URL` | your Supabase URL |
+   | `VITE_SUPABASE_ANON_KEY` | anon key |
+
+6. Click **Deploy** → wait ~1–2 min → *Congratulations!* → **Continue to
+   Dashboard**. Note the production domain shown at the top
+   (e.g. `https://vmtb-jitsi.vercel.app`).
+
+**C. Point it at the right branch**
+
+7. Project → **Settings** → **Git** → *Production Branch* → change to
+   `feature/codebase-reorg` → **Save**.
+
+**D. Wire up CI/CD**
+
+8. Get the two IDs: project → **Settings** → **General** → scroll down —
+   copy **Vercel Organization ID** and **Vercel Project ID**
+   (alternative: run `npx vercel link` inside `jitsi-frontend/` locally and
+   read `.vercel/project.json`).
+9. Create a token: <https://vercel.com/account/settings/tokens> →
+   **Add Token…** → scope *Full Account*, expiry e.g. 90 days → copy it
+   immediately (shown only once). Calendar a reminder to rotate it.
+10. Add three GitHub secrets (§2.7): `VERCEL_TOKEN`, `VERCEL_ORG_ID`,
+    `VERCEL_PROJECT_ID`.
+11. Test the button: GitHub → **Actions → Deploy jitsi-frontend (Vercel)** →
+    *Run workflow* → wait for the green check.
+
+    (Vercel's git-integration also auto-deploys on push; disable under
+    Settings → Git if you want button-only.)
+
+**E. Sanity-check**
+
+12. Open `https://vmtb-jitsi.vercel.app` directly (no query params) → you
+    should see the friendly error page ("No room name provided…") — proves
+    the app loads and builds correctly.
+
+---
 
 ### 7.3 Loop back: point the main app at the loader
 
-Render dashboard → `vmtb-main` → **Environment**:
+1. Render dashboard → `vmtb-main` → **Environment** → edit
+   `VITE_SERVER_LOADER_URL` → set it to your Vercel production URL from
+   §7.2 (e.g. `https://vmtb-jitsi.vercel.app`) → **Save Changes**.
+2. Trigger **Actions → Deploy main app (Render)** — env var changes only
+   apply after a rebuild.
 
-- Set `VITE_SERVER_LOADER_URL` = your Vercel production URL from §7.2
+### 7.4 Final frontend checklist
 
-Then trigger **Actions → Deploy main app (Render)** (env var changes only
-apply after a redeploy).
-
-### 7.4 Verify the frontends
-
-- Open the Render URL → log in → you should see your cases/MTBs.
-- Open the Vercel URL directly with no params → you should see the friendly
-  error page ("No room name provided…") — that proves it loads.
+- [ ] Render URL loads the login page and you can log in.
+- [ ] Refreshing a deep link (e.g. `/my-cases`) does **not** 404 (SPA rule works).
+- [ ] Vercel URL without params shows the friendly error page.
+- [ ] Both deploy buttons in GitHub Actions complete with green checks.
 
 ---
 
