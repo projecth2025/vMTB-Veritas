@@ -1,0 +1,47 @@
+# Deploy jitsi-frontend (the meeting loader page) to Vercel.
+#
+# Run manually from the GitHub "Actions" tab -> "Run workflow".
+# The build runs on Vercel's side using the environment variables configured
+# in the Vercel project dashboard (Settings -> Environment Variables).
+#
+# Required repository secrets (see docs/DEPLOYMENT.md §7):
+#   VERCEL_TOKEN       - Vercel personal access token
+#   VERCEL_ORG_ID      - your Vercel org/team id
+#   VERCEL_PROJECT_ID  - id of the jitsi-frontend Vercel project
+
+name: Deploy jitsi-frontend (Vercel)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-jitsi-frontend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: jitsi-frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: jitsi-frontend/package-lock.json
+
+      - run: npm ci
+
+      - name: Deploy to Vercel (production)
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: npx vercel@latest deploy --prod --yes
