@@ -728,6 +728,7 @@ ws.on("message", (m) => console.log(m.toString()));
 | Symptom | Likely cause / fix |
 |---|---|
 | Build fails: `unrecognized arguments: --build-arg` | old workflow version — pull latest `feature/codebase-reorg` and re-run the button |
+| Build "fails" with `This tool can only stream logs if you are Viewer/Owner` | old workflow version — the build itself may have succeeded (check Console → Cloud Build → History). Latest workflows poll status instead of streaming logs |
 | Build fails: `storage.objects.get denied` on `<project>_cloudbuild` | Cloud Build's default SA lacks roles — run the "Cloud Build's default service account" block in §2.3, then re-run the button |
 | Build fails pushing to Artifact Registry (`denied` on docker.pkg.dev) | same block in §2.3 (artifactregistry.writer missing for the build SA) |
 | STT deploy fails: GPU quota error | §2.5 quota not granted yet, or wrong region |
