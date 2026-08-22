@@ -94,7 +94,7 @@ jobs:
             --max-instances 5 \
             --timeout 300 \
             --set-env-vars "GCS_BUCKET=vmtb-transcripts,GCP_PROJECT_ID=$PROJECT_ID,LLM_PROVIDER=mistral,LLM_BASE_URL=https://api.mistral.ai/v1,LLM_MODEL=mistral-small-latest" \
-            --set-secrets "SUPABASE_URL=supabase-url:latest,SUPABASE_SERVICE_ROLE_KEY=supabase-service-role-key:latest,LLM_API_KEY=llm-api-key:latest,PUBSUB_PUSH_TOKEN=pubsub-push-token:latest"
+            --set-secrets "SUPABASE_URL=supabase-url:latest,SUPABASE_SERVICE_ROLE_KEY=supabase-service-role-key:latest,LLM_API_KEY=llm-api-key:latest"
 
       - name: Show service URL
         run: |
@@ -103,21 +103,19 @@ jobs:
             --format 'value(status.url)'
 
       # Keeps the Pub/Sub -> worker link correct on every deploy: creates the
-      # push subscription the first time, updates it afterwards. Requires the
-      # "meeting-transcripts" topic and the runtime SA to have run.invoker.
+      # push subscription the first time, updates it afterwards. Auth is OIDC:
+      # Pub/Sub signs calls as RUNTIME_SA, which must have run.invoker on this
+      # service (granted in docs/DEPLOYMENT.md §2.3).
       - name: Wire Pub/Sub push subscription
         run: |
           WORKER_URL=$(gcloud run services describe "$SERVICE" \
             --project "$PROJECT_ID" --region "$REGION" --format 'value(status.url)')
-          PUSH_TOKEN=$(gcloud secrets versions access latest --secret=pubsub-push-token)
 
           gcloud pubsub subscriptions create meeting-transcripts-worker \
             --topic=meeting-transcripts \
             --push-endpoint="${WORKER_URL}/pubsub/push" \
             --push-auth-service-account="${RUNTIME_SA}@${PROJECT_ID}.iam.gserviceaccount.com" \
-            --push-auth-token="$PUSH_TOKEN" \
             --ack-deadline=60 \
           || gcloud pubsub subscriptions update meeting-transcripts-worker \
             --push-endpoint="${WORKER_URL}/pubsub/push" \
-            --push-auth-service-account="${RUNTIME_SA}@${PROJECT_ID}.iam.gserviceaccount.com" \
-            --push-auth-token="$PUSH_TOKEN"
+            --push-auth-service-account="${RUNTIME_SA}@${PROJECT_ID}.iam.gserviceaccount.com"
