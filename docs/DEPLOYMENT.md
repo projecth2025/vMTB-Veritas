@@ -191,11 +191,15 @@ for SECRET in supabase-url supabase-service-role-key llm-api-key pubsub-push-tok
 done
 ```
 
-### 2.5 GPU quota (request early — approval can take days)
+### 2.5 GPU quota
 
-Console → **IAM & Admin → Quotas & System Limits** → filter `NVIDIA_L4_GPUS`,
-region `asia-southeast1` → **Edit** → request **1**.
-Without this the stt-service deploy fails.
+Good news: new projects are **automatically granted 3 L4 GPUs** (zonal
+redundancy off) on first GPU deployment — enough for `--max-instances 2`.
+Our deploy uses `--no-gpu-zonal-redundancy` (cheaper, no reservation), so in
+most cases you don't need to request anything. If the STT deploy still fails
+with a GPU quota error, request quota: Console → **IAM & Admin → Quotas &
+System Limits** → filter `NVIDIA_L4_GPUS`, region `asia-southeast1` →
+request **3** for *without zonal redundancy*.
 
 ### 2.6 GitHub Actions authentication for GCP (Workload Identity Federation)
 
@@ -731,6 +735,8 @@ ws.on("message", (m) => console.log(m.toString()));
 | Build "fails" with `This tool can only stream logs if you are Viewer/Owner` | old workflow version — the build itself may have succeeded (check Console → Cloud Build → History). Latest workflows poll status instead of streaming logs |
 | Build fails: `storage.objects.get denied` on `<project>_cloudbuild` | Cloud Build's default SA lacks roles — run the "Cloud Build's default service account" block in §2.3, then re-run the button |
 | Build fails pushing to Artifact Registry (`denied` on docker.pkg.dev) | same block in §2.3 (artifactregistry.writer missing for the build SA) |
+| STT deploy fails: GPU zonal-redundancy quota error | old workflow version — latest adds `--no-gpu-zonal-redundancy`; pull and re-run |
+| STT deploy fails: container failed to start on PORT=8080 | old image — the Dockerfile now listens on `$PORT`; re-run the button so a fresh build deploys |
 | STT deploy fails: GPU quota error | §2.5 quota not granted yet, or wrong region |
 | Meeting stuck on loader ("Server starting…") | `curl $ACT_URL/status` → see which component isn't ready; check that service's Cloud Run logs |
 | `/start-jitsi` components show `error` | IAM bindings from §2.3 missing; check activation backend logs |

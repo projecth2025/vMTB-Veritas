@@ -23,5 +23,6 @@ COPY app ./app
 ARG STT_MODEL=medium
 RUN STT_MODEL=${STT_MODEL} python -c "from faster_whisper import WhisperModel; WhisperModel('${STT_MODEL}', device='cpu', compute_type='int8'); print('model baked:', '${STT_MODEL}')"
 
+# Listen on $PORT (Cloud Run injects PORT=8080); fall back to 9090 locally.
 EXPOSE 9090
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9090"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-9090}"]

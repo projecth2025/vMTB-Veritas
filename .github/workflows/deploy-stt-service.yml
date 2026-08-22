@@ -103,6 +103,7 @@ jobs:
             --max-instances 2 \
             --timeout 3600 \
             --no-allow-unauthenticated \
+            --no-gpu-zonal-redundancy \
             --set-env-vars "STT_MODEL=medium,STT_DEVICE=cuda,STT_COMPUTE_TYPE=float16"
 
       - name: Show service URL
