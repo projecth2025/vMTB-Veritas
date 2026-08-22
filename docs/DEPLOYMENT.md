@@ -70,7 +70,22 @@ Manual links: #1, #2, #3, #9. Everything else self-wires during deploys.
   gcloud auth login && gcloud config set project YOUR_PROJECT_ID
   gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)'
   ```
-- Owner/editor rights on the GCP project (for one-time IAM setup).
+- **You must be `roles/owner` on the project** (not just Editor or Project
+  IAM Admin). University/org-shared projects usually aren't. Check:
+  ```bash
+  gcloud projects get-iam-policy YOUR_PROJECT_ID \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:$(gcloud config get-value account)" \
+    --format="table(bindings.role)"
+  ```
+  If `roles/owner` is missing, ask whoever manages the project to run:
+  ```bash
+  gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+    --member="user:YOUR_EMAIL" --role="roles/owner"
+  ```
+  Otherwise many steps below fail with `setIamPolicy denied` errors.
+  *(Workaround if you only have Project IAM Admin: replace per-secret IAM
+  bindings in §2.4 with one project-level binding — see troubleshooting.)*
 - Your GitHub repo pushed and Actions enabled, e.g. `harishbabu2007/vMTB-Veritas`.
   All work currently lives on the `feature/codebase-reorg` branch — §7
   configures both frontends to build from it.
@@ -114,7 +129,7 @@ workflow — no manual step.)
 ### 2.3 Service accounts & permissions
 
 ```bash
-PROJECT_ID=YOUR_PROJECT_ID
+PROJECT_ID=vmtb-new
 
 gcloud iam service-accounts create vmtb-services   --display-name="vMTB transcription services"
 gcloud iam service-accounts create vmtb-activator  --display-name="vMTB meeting activator"
@@ -147,9 +162,11 @@ done
 ### 2.4 Secrets (Secret Manager)
 
 ```bash
-printf '%s' 'https://YOUR-PROJECT.supabase.co' | \
+PROJECT_ID=vmtb-new
+
+printf '%s' 'https://gwvqxetjheveelqrkjhg.supabase.co' | \
   gcloud secrets create supabase-url --data-file=- --replication-policy=automatic
-printf '%s' 'PASTE_SERVICE_ROLE_KEY' | \
+printf '%s' 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dnF4ZXRqaGV2ZWVscXJramhnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NTU5NjU3MywiZXhwIjoyMTAxMTcyNTczfQ.RZbZWJguVsKdZiOsOlbe0jmew8jDaOwlgQd_Ru9V0jM' | \
   gcloud secrets create supabase-service-role-key --data-file=- --replication-policy=automatic
 openssl rand -hex 24 | \
   gcloud secrets create pubsub-push-token --data-file=- --replication-policy=automatic
@@ -175,8 +192,9 @@ Without this the stt-service deploy fails.
 No keys stored in GitHub — OIDC token exchange:
 
 ```bash
-PROJECT_NUMBER=YOUR_PROJECT_NUMBER
+PROJECT_NUMBER=670475652201
 GH_REPO="YOUR_GH_USER/vMTB-Veritas"
+PROJECT_ID=vmtb-new
 
 gcloud iam workload-identity-pools create github-pool \
   --location=global --display-name="GitHub Actions pool"
@@ -699,6 +717,7 @@ ws.on("message", (m) => console.log(m.toString()));
 
 | Symptom | Likely cause / fix |
 |---|---|
+| `setIamPolicy denied` on project or secrets | you're not project Owner (§1). Either get `roles/owner`, or — for the §2.4 secret bindings only — use one project-level binding instead: `gcloud projects add-iam-policy-binding PROJECT_ID --member="serviceAccount:vmtb-services@PROJECT_ID.iam.gserviceaccount.com" --role="roles/secretmanager.secretAccessor"` |
 | STT deploy fails: GPU quota error | §2.5 quota not granted yet, or wrong region |
 | Meeting stuck on loader ("Server starting…") | `curl $ACT_URL/status` → see which component isn't ready; check that service's Cloud Run logs |
 | `/start-jitsi` components show `error` | IAM bindings from §2.3 missing; check activation backend logs |
