@@ -55,11 +55,32 @@ jobs:
             echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
+      # Submit asynchronously and poll status: the CI identity cannot stream
+      # logs from the default logs bucket (needs project Viewer), which made
+      # gcloud exit non-zero even on successful builds.
       - name: Build image (Cloud Build)
         run: |
-          gcloud builds submit "$SERVICE" \
+          set -euo pipefail
+          IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}"
+          BUILD_ID=$(gcloud builds submit "$SERVICE" \
             --project "$PROJECT_ID" \
-            --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}"
+            --tag "$IMAGE" \
+            --format='value(id)' \
+            --async)
+          echo "Build id: $BUILD_ID"
+          for i in $(seq 1 90); do
+            STATUS=$(gcloud builds describe "$BUILD_ID" --project "$PROJECT_ID" --format='value(status)')
+            echo "[$i] status: $STATUS"
+            case "$STATUS" in
+              SUCCESS) exit 0 ;;
+              FAILURE|CANCELLED|TIMEOUT|INTERNAL_ERROR)
+                echo "::error::Cloud Build $BUILD_ID finished with $STATUS - inspect logs at https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$PROJECT_ID"
+                exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "::error::Timed out waiting for Cloud Build $BUILD_ID"
+          exit 1
 
       - name: Deploy to Cloud Run
         run: |
