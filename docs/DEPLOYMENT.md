@@ -167,13 +167,6 @@ for ROLE in roles/storage.objectAdmin roles/artifactregistry.writer roles/loggin
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:$BUILD_SA" --role="$ROLE"
 done
-
-# --- CI deployer needs to READ the Pub/Sub push token ----------------------
-# (secretmanager.viewer alone shows metadata but cannot access values; the
-# transcript-worker workflow embeds the token into the push subscription.)
-gcloud secrets add-iam-policy-binding pubsub-push-token \
-  --member="serviceAccount:vmtb-deployer@$PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/secretmanager.secretAccessor"
 ```
 
 ### 2.4 Secrets (Secret Manager)
@@ -181,21 +174,25 @@ gcloud secrets add-iam-policy-binding pubsub-push-token \
 ```bash
 PROJECT_ID=vmtb-new
 
-printf '%s' 'https://gwvqxetjheveelqrkjhg.supabase.co' | \
+printf '%s' 'https://YOUR-PROJECT.supabase.co' | \
   gcloud secrets create supabase-url --data-file=- --replication-policy=automatic
-printf '%s' 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dnF4ZXRqaGV2ZWVscXJramhnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NTU5NjU3MywiZXhwIjoyMTAxMTcyNTczfQ.RZbZWJguVsKdZiOsOlbe0jmew8jDaOwlgQd_Ru9V0jM' | \
+printf '%s' 'PASTE_SERVICE_ROLE_KEY_HERE' | \
   gcloud secrets create supabase-service-role-key --data-file=- --replication-policy=automatic
-openssl rand -hex 24 | \
-  gcloud secrets create pubsub-push-token --data-file=- --replication-policy=automatic
 # llm-api-key is filled with the real Mistral key in §5; placeholder until then:
 printf '%s' 'placeholder' | \
   gcloud secrets create llm-api-key --data-file=- --replication-policy=automatic
 
-for SECRET in supabase-url supabase-service-role-key llm-api-key pubsub-push-token; do
+for SECRET in supabase-url supabase-service-role-key llm-api-key; do
   gcloud secrets add-iam-policy-binding "$SECRET" \
     --member="serviceAccount:vmtb-services@$PROJECT_ID.iam.gserviceaccount.com" \
     --role="roles/secretmanager.secretAccessor"
 done
+```
+
+> ⚠️ **Never paste real keys into this file or any committed file.** Placeholders
+> only — real values go straight into Secret Manager / platform dashboards.
+> If a real key ever lands in git, treat it as compromised: rotate it first,
+> clean history second.
 ```
 
 ### 2.5 GPU quota
@@ -751,7 +748,7 @@ ws.on("message", (m) => console.log(m.toString()));
 | No captions / nothing in proxy logs | §6.5 wiring wrong: jicofo.conf template, prosody module not loaded (`systemctl status prosody`), or client toggle off |
 | Segments never appear in Supabase | proxy secrets wrong (`supabase-url` / `supabase-service-role-key`); check proxy logs for store errors |
 | Worker never runs; status stuck PENDING | push subscription broken — rerun the transcript-worker workflow (it repairs it) |
-| Worker wiring step fails: `secretmanager.versions.access denied` | CI deployer lacks secret read — run the `pubsub-push-token` accessor binding in §2.3 (last block), re-run the button |
+| Worker wiring step fails with `unrecognized arguments: --push-auth-token` | old workflow version — latest wires the subscription via OIDC only (`--push-auth-service-account`); pull and re-run |
 | Meeting FAILED with LLM error | bad/expired Mistral key → fix `llm-api-key` secret, redeploy worker |
 | WebSocket drops at exactly 60 min | Cloud Run hard cap; proxy/STT reconnect automatically — acceptable for MVP |
 | CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend, redeploy |
