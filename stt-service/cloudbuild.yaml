@@ -1,0 +1,27 @@
+# Cloud Build config for stt-service.
+#
+# Required because `gcloud builds submit` cannot pass Docker --build-arg
+# flags directly; the substitutions below map to the Dockerfile ARGs and are
+# provided by .github/workflows/deploy-stt-service.yml via --substitutions:
+#   _IMAGE       (required) full tag to build & push
+#   _STT_DEVICE  gpu | cpu   (default gpu)
+#   _STT_MODEL   whisper model to bake (default medium)
+substitutions:
+  _STT_DEVICE: 'gpu'
+  _STT_MODEL: 'medium'
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--build-arg=STT_DEVICE=${_STT_DEVICE}'
+      - '--build-arg=STT_MODEL=${_STT_MODEL}'
+      - '--tag=${_IMAGE}'
+      - '.'
+
+images:
+  - '${_IMAGE}'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: 'CLOUD_LOGGING_ONLY'

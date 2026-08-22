@@ -60,12 +60,11 @@ jobs:
 
       - name: Build image (Cloud Build)
         run: |
+          IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}"
           gcloud builds submit "$SERVICE" \
             --project "$PROJECT_ID" \
-            --machine-type e2-highcpu-8 \
-            --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/$SERVICE:${{ steps.tag.outputs.tag }}" \
-            --build-arg STT_DEVICE=gpu \
-            --build-arg STT_MODEL=medium
+            --config "$SERVICE/cloudbuild.yaml" \
+            --substitutions "_IMAGE=$IMAGE,_STT_DEVICE=gpu,_STT_MODEL=medium"
 
       - name: Deploy to Cloud Run (GPU)
         run: |

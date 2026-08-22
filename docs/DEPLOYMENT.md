@@ -157,6 +157,16 @@ for ROLE in roles/run.admin roles/iam.serviceAccountUser roles/artifactregistry.
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:vmtb-deployer@$PROJECT_ID.iam.gserviceaccount.com" --role="$ROLE"
 done
+
+# --- Cloud Build's default service account ---------------------------------
+# On newer projects it does NOT have Editor, so Cloud Build cannot read its
+# own uploaded sources or push images. Without this, builds fail with
+# "storage.objects.get denied on <project>_cloudbuild" or registry errors.
+BUILD_SA="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com"
+for ROLE in roles/storage.objectAdmin roles/artifactregistry.writer roles/logging.logWriter; do
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:$BUILD_SA" --role="$ROLE"
+done
 ```
 
 ### 2.4 Secrets (Secret Manager)
@@ -717,7 +727,9 @@ ws.on("message", (m) => console.log(m.toString()));
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `setIamPolicy denied` on project or secrets | you're not project Owner (§1). Either get `roles/owner`, or — for the §2.4 secret bindings only — use one project-level binding instead: `gcloud projects add-iam-policy-binding PROJECT_ID --member="serviceAccount:vmtb-services@PROJECT_ID.iam.gserviceaccount.com" --role="roles/secretmanager.secretAccessor"` |
+| Build fails: `unrecognized arguments: --build-arg` | old workflow version — pull latest `feature/codebase-reorg` and re-run the button |
+| Build fails: `storage.objects.get denied` on `<project>_cloudbuild` | Cloud Build's default SA lacks roles — run the "Cloud Build's default service account" block in §2.3, then re-run the button |
+| Build fails pushing to Artifact Registry (`denied` on docker.pkg.dev) | same block in §2.3 (artifactregistry.writer missing for the build SA) |
 | STT deploy fails: GPU quota error | §2.5 quota not granted yet, or wrong region |
 | Meeting stuck on loader ("Server starting…") | `curl $ACT_URL/status` → see which component isn't ready; check that service's Cloud Run logs |
 | `/start-jitsi` components show `error` | IAM bindings from §2.3 missing; check activation backend logs |
