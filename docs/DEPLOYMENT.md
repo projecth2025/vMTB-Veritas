@@ -167,6 +167,13 @@ for ROLE in roles/storage.objectAdmin roles/artifactregistry.writer roles/loggin
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:$BUILD_SA" --role="$ROLE"
 done
+
+# --- CI deployer needs to READ the Pub/Sub push token ----------------------
+# (secretmanager.viewer alone shows metadata but cannot access values; the
+# transcript-worker workflow embeds the token into the push subscription.)
+gcloud secrets add-iam-policy-binding pubsub-push-token \
+  --member="serviceAccount:vmtb-deployer@$PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
 ```
 
 ### 2.4 Secrets (Secret Manager)
@@ -744,6 +751,7 @@ ws.on("message", (m) => console.log(m.toString()));
 | No captions / nothing in proxy logs | §6.5 wiring wrong: jicofo.conf template, prosody module not loaded (`systemctl status prosody`), or client toggle off |
 | Segments never appear in Supabase | proxy secrets wrong (`supabase-url` / `supabase-service-role-key`); check proxy logs for store errors |
 | Worker never runs; status stuck PENDING | push subscription broken — rerun the transcript-worker workflow (it repairs it) |
+| Worker wiring step fails: `secretmanager.versions.access denied` | CI deployer lacks secret read — run the `pubsub-push-token` accessor binding in §2.3 (last block), re-run the button |
 | Meeting FAILED with LLM error | bad/expired Mistral key → fix `llm-api-key` secret, redeploy worker |
 | WebSocket drops at exactly 60 min | Cloud Run hard cap; proxy/STT reconnect automatically — acceptable for MVP |
 | CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend, redeploy |
