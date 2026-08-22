@@ -5,7 +5,7 @@
 #
 # Required repository secrets: GCP_PROJECT_ID, GCP_WIF_PROVIDER, GCP_DEPLOY_SA
 # Required Secret Manager secrets: supabase-url, supabase-service-role-key,
-# llm-api-key (Mistral key), pubsub-push-token. See docs/DEPLOYMENT.md.
+# llm-api-key (Mistral key). See docs/DEPLOYMENT.md.
 
 name: Deploy transcript-worker
 
