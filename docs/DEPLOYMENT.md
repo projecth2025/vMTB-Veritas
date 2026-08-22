@@ -193,7 +193,7 @@ No keys stored in GitHub — OIDC token exchange:
 
 ```bash
 PROJECT_NUMBER=670475652201
-GH_REPO="YOUR_GH_USER/vMTB-Veritas"
+GH_REPO="projecth2025/vMTB-Veritas"
 PROJECT_ID=vmtb-new
 
 gcloud iam workload-identity-pools create github-pool \
