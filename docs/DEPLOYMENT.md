@@ -153,7 +153,8 @@ gcloud iam service-accounts add-iam-policy-binding \
 
 # deployer SA: what GitHub Actions may do
 for ROLE in roles/run.admin roles/iam.serviceAccountUser roles/artifactregistry.writer \
-            roles/cloudbuild.builds.builder roles/storage.objectAdmin roles/secretmanager.viewer; do
+            roles/cloudbuild.builds.builder roles/storage.objectAdmin roles/secretmanager.viewer \
+            roles/pubsub.editor; do
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:vmtb-deployer@$PROJECT_ID.iam.gserviceaccount.com" --role="$ROLE"
 done
@@ -749,6 +750,7 @@ ws.on("message", (m) => console.log(m.toString()));
 | Segments never appear in Supabase | proxy secrets wrong (`supabase-url` / `supabase-service-role-key`); check proxy logs for store errors |
 | Worker never runs; status stuck PENDING | push subscription broken — rerun the transcript-worker workflow (it repairs it) |
 | Worker wiring step fails with `unrecognized arguments: --push-auth-token` | old workflow version — latest wires the subscription via OIDC only (`--push-auth-service-account`); pull and re-run |
+| Worker wiring step fails with `User not authorized` (subscriptions) | CI deployer lacks Pub/Sub rights — grant `roles/pubsub.editor` to `vmtb-deployer@…` (§2.3), re-run the button |
 | Meeting FAILED with LLM error | bad/expired Mistral key → fix `llm-api-key` secret, redeploy worker |
 | WebSocket drops at exactly 60 min | Cloud Run hard cap; proxy/STT reconnect automatically — acceptable for MVP |
 | CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend, redeploy |
