@@ -35,6 +35,10 @@ export class SupabaseStore {
 
   /**
    * Persist one final transcript segment. Non-final events are rejected.
+   *
+   * Live segments can race ahead of the parent meeting_transcripts row
+   * (which is guaranteed at session close), hitting the FK constraint.
+   * On a foreign-key violation we create the parent and retry once.
    */
   async insertFinalSegment(event: TranscriptEvent): Promise<void> {
     if (!event.isFinal) {
@@ -43,26 +47,35 @@ export class SupabaseStore {
     }
     if (!event.text || !event.text.trim()) return;
 
-    try {
-      const { error } = await this.client.from('meeting_transcript_segments').insert({
-        meeting_id: event.meetingId,
-        participant_id: event.participantId,
-        start_time: event.startTime,
-        end_time: event.endTime,
-        text: event.text,
-        is_final: true,
-        provider: event.provider,
-      });
-      if (error) {
-        logger.warn({ err: error.message, meetingId: event.meetingId, participantId: event.participantId }, 'store: segment insert failed');
-        return;
-      }
+    const row = {
+      meeting_id: event.meetingId,
+      participant_id: event.participantId,
+      start_time: event.startTime,
+      end_time: event.endTime,
+      text: event.text,
+      is_final: true,
+      provider: event.provider,
+    };
+
+    let { error } = await this.client.from('meeting_transcript_segments').insert(row);
+
+    // Postgres FK violation = parent row not created yet (live insert race).
+    if (error && ((error as { code?: string }).code === '23503' || /foreign key/i.test(error.message))) {
       logger.debug(
-        { meetingId: event.meetingId, participantId: event.participantId, length: event.text.length },
-        'store: final segment persisted',
+        { meetingId: event.meetingId, participantId: event.participantId },
+        'store: parent meeting row missing, ensuring and retrying once',
       );
-    } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'store: segment insert exception');
+      await this.ensureMeeting(event.meetingId);
+      ({ error } = await this.client.from('meeting_transcript_segments').insert(row));
     }
+
+    if (error) {
+      logger.warn({ err: error.message, meetingId: event.meetingId, participantId: event.participantId }, 'store: segment insert failed');
+      return;
+    }
+    logger.debug(
+      { meetingId: event.meetingId, participantId: event.participantId, length: event.text.length },
+      'store: final segment persisted',
+    );
   }
 }
