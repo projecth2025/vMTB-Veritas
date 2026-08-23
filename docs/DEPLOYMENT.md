@@ -675,6 +675,16 @@ You will need ready: `<ACT_URL>` (§4), `<VM_IP>` (§6.2), Supabase URL + anon k
    §7.2 (e.g. `https://vmtb-jitsi.vercel.app`) → **Save Changes**.
 2. Trigger **Actions → Deploy main app (Render)** — env var changes only
    apply after a rebuild.
+3. **Allow-list the Vercel origin on the activation backend (required)** —
+   the loader calls `/start-jitsi` straight from the browser, and the
+   backend's CORS list doesn't include your new Vercel URL by default:
+   ```bash
+   gcloud run services update jitsi-activation-backend \
+     --project YOUR_PROJECT_ID --region asia-southeast1 \
+     --update-env-vars CORS_ORIGINS="https://vmtb-jitsi.vercel.app,https://www.vmtb.in,https://server.vmtb.in,http://localhost:5173"
+   ```
+   (use your real Vercel URL; takes effect on the next request — no redeploy
+   needed since Cloud Run restarts the container on env updates)
 
 ### 7.4 Final frontend checklist
 
@@ -765,7 +775,8 @@ ws.on("message", (m) => console.log(m.toString()));
 | Worker wiring step fails with `User not authorized` (subscriptions) | CI deployer lacks Pub/Sub rights — grant `roles/pubsub.editor` to `vmtb-deployer@…` (§2.3), re-run the button |
 | Meeting FAILED with LLM error | bad/expired Mistral key → fix `llm-api-key` secret, redeploy worker |
 | WebSocket drops at exactly 60 min | Cloud Run hard cap; proxy/STT reconnect automatically — acceptable for MVP |
-| CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend, redeploy |
+| CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend (§7.3 step 3), redeploy |
+| Loader shows "Network error (CORS or server down)" when starting a meeting | same as above — your Vercel origin is missing from the activation backend's `CORS_ORIGINS` |
 | Meeting iframe blank / external_api.js fails to load | the self-signed cert wasn't accepted in that browser yet — visit `https://<VM_IP>` directly and proceed past the warning (§8 step 2) |
 | Google OAuth lands on an old/wrong domain | Supabase **Site URL / Redirect URLs** still point there — fix per §7.1 step 9 |
 | Render site 404s on refresh / deep links | missing SPA rewrite rule `/* → /index.html` (§7.1 step 4) |
