@@ -3,6 +3,10 @@
 ARG STT_DEVICE=cpu
 FROM python:3.11-slim
 
+# Re-declare inside the stage: args from before FROM are NOT inherited here.
+ARG STT_DEVICE=cpu
+ARG STT_MODEL=medium
+
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /srv
 
@@ -26,8 +30,16 @@ COPY app ./app
 
 # Bake the Whisper model into the image at build time so Cloud Run instances
 # start without hitting HuggingFace. Bakes on CPU regardless of runtime device.
-ARG STT_MODEL=medium
 RUN STT_MODEL=${STT_MODEL} python -c "from faster_whisper import WhisperModel; WhisperModel('${STT_MODEL}', device='cpu', compute_type='int8'); print('model baked:', '${STT_MODEL}')"
+
+# Build-time assertion: never ship a GPU image without the CUDA libraries.
+# (This failed silently for weeks because ARGs declared before FROM are not
+# visible inside the stage - see the re-declaration at the top.)
+RUN if [ "$STT_DEVICE" = "gpu" ]; then \
+      test -f /usr/local/lib/python3.11/site-packages/nvidia/cublas/lib/libcublas.so.12 \
+        || { echo "FATAL: libcublas.so.12 missing from GPU image"; exit 1; }; \
+      echo "GPU image OK: cublas present"; \
+    fi
 
 # Listen on $PORT (Cloud Run injects PORT=8080); fall back to 9090 locally.
 EXPOSE 9090
