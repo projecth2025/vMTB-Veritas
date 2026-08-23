@@ -106,22 +106,41 @@ export class SelfHostedSTTProvider implements STTProvider {
   /**
    * Build the Authorization header for the STT WebSocket upgrade.
    * Returns undefined when ID-token auth is disabled (local dev / dummy).
+   *
+   * Primary source: the Cloud Run/GCE metadata server, which mints an ID
+   * token for the attached service account with zero configuration. Falls
+   * back to google-auth-library for environments without the metadata
+   * endpoint (e.g. Workload Identity on GKE).
    */
   private async buildAuthHeaders(): Promise<Record<string, string> | undefined> {
     if (!this.options.useIdToken) return undefined;
+    // Cloud Run expects the audience to be the service's https origin.
+    const audience = new URL(this.options.url.replace(/^ws(s?):/, 'http$1:')).origin;
+    try {
+      const resp = await fetch(
+        `http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${encodeURIComponent(audience)}`,
+        { headers: { 'Metadata-Flavor': 'Google' } },
+      );
+      if (!resp.ok) throw new Error(`metadata responded ${resp.status}`);
+      const token = (await resp.text()).trim();
+      if (!token || token.split('.').length !== 3) throw new Error('malformed id token');
+      logger.debug({ audience }, 'stt: fetched id token from metadata server');
+      return { authorization: `Bearer ${token}` };
+    } catch (metaErr) {
+      const metaMsg = metaErr instanceof Error ? metaErr.message : String(metaErr);
+      logger.warn({ err: metaMsg }, 'stt: metadata id-token fetch failed, trying google-auth-library');
+    }
     try {
       const { GoogleAuth } = await import('google-auth-library');
-      // Cloud Run expects the audience to be the service's https origin.
-      const audience = new URL(this.options.url.replace(/^ws(s?):/, 'http$1:')).origin;
       const auth = new GoogleAuth();
       const client = await auth.getIdTokenClient(audience);
       const { token } = await client.getAccessToken();
       if (!token) throw new Error('no id token returned');
-      logger.debug({ audience }, 'stt: fetched id token');
+      logger.debug({ audience }, 'stt: fetched id token via google-auth-library');
       return { authorization: `Bearer ${token}` };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.error({ err: message }, 'stt: failed to fetch id token, connecting without auth');
+      logger.error({ err: message }, 'stt: failed to fetch id token entirely, connecting WITHOUT auth - expect 401s if STT requires IAM');
       return undefined;
     }
   }

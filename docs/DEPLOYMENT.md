@@ -393,11 +393,16 @@ page. Meetings already work at this point; transcription comes next.
 Four edits on the VM. Replace `<PROXY_URL>` with the value saved in §4
 (e.g. `https://opus-transcriber-proxy-xxxxx-ey.a.run.app`).
 
-**(a) Force-enable transcription on every room (Prosody module)**
+**(a) Force-enable background transcription on every room (Prosody module)**
+
+This makes transcription fully automatic: no one has to press the captions
+button. Both server-side gates are forced on at room creation:
 
 ```bash
 sudo tee /usr/share/jitsi-meet/prosody-plugins/mod_force_async_transcription.lua > /dev/null <<'EOF'
--- Forces asyncTranscription=true on every room's metadata.
+-- Forces background transcription on EVERY room, no UI action needed:
+--   asyncTranscription=true            -> Jicofo transcribes without a client request
+--   recording.isTranscribingEnabled=true -> satisfies the second (UI) gate
 local util = module:require 'util';
 local is_healthcheck_room = util.is_healthcheck_room;
 
@@ -406,7 +411,9 @@ module:hook('muc-room-created', function(event)
     if is_healthcheck_room(room.jid) then return; end
     if not room.jitsiMetadata then room.jitsiMetadata = {}; end
     room.jitsiMetadata.asyncTranscription = true;
-    module:log('info', 'Forced asyncTranscription=true for %s', room.jid);
+    if not room.jitsiMetadata.recording then room.jitsiMetadata.recording = {}; end
+    room.jitsiMetadata.recording.isTranscribingEnabled = true;
+    module:log('info', 'Forced background transcription for %s', room.jid);
 end, -2); -- after mod_room_metadata_component (-1)
 EOF
 ```
@@ -714,9 +721,10 @@ Do this exactly once, in order, and note anything that breaks.
 3. **Start a meeting** — main app → MTB → *Meeting* → *Start Meeting*.
    It opens the Vercel loader, which polls `/start-jitsi`; expect **1–3 min**
    (VM boot + GPU alloc + model load) before the room opens.
-4. **Talk** — join from a second device/tab if possible. With
-   `force_async_transcription` installed, JVB should connect to the proxy
-   automatically. Captions appear because `sendBack=true`.
+4. **Talk** — join from a second device/tab if possible. Transcription starts
+   **automatically** when the room is created (§6.5a forces both metadata
+   gates), so nobody needs to press the captions button — captions are just
+   an optional on-screen display.
    Check: proxy logs (Cloud Run → opus-transcriber-proxy → Logs) show
    `transcription session opened`.
 5. **Segments land** — Supabase → Table Editor →
