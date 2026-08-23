@@ -66,7 +66,7 @@ describe('processMeeting', () => {
     );
     expect(fakes.upload).toHaveBeenCalledWith(
       'meetings/m1/transcript/transcript-v1.txt',
-      '[Speaker 1] hello world [Speaker 2] second speaker',
+      '[Speaker 1] hello world\n\n[Speaker 2] second speaker',
       'text/plain',
     );
     expect(fakes.complete).toHaveBeenCalledWith('m1', 'meetings/m1/transcript/transcript-v1.json', 1, null);
@@ -159,7 +159,7 @@ describe('buildArtifact', () => {
     // p1 appears first -> Speaker 1; p2 second -> Speaker 2
     expect(artifact.segments[0]!.speaker).toBe('Speaker 1');
     expect(artifact.segments[1]!.speaker).toBe('Speaker 2');
-    expect(artifact.text).toBe('[Speaker 1] hello world [Speaker 2] second speaker');
+    expect(artifact.text).toBe('[Speaker 1] hello world\n\n[Speaker 2] second speaker');
     expect(artifact.generated_at).toBe(new Date(1751979219000).toISOString());
   });
 
@@ -171,7 +171,7 @@ describe('buildArtifact', () => {
     const artifact = buildArtifact('m1', segments, () => 1, labels);
     expect(artifact.segments[0]!.speaker).toBe('Dr. Patel');
     expect(artifact.segments[1]!.speaker).toBe('Dr. Lee');
-    expect(artifact.text).toBe('[Dr. Patel] hello world [Dr. Lee] second speaker');
+    expect(artifact.text).toBe('[Dr. Patel] hello world\n\n[Dr. Lee] second speaker');
   });
 
   it('handles empty segment lists', () => {
@@ -191,6 +191,6 @@ describe('buildArtifact', () => {
     const outcome = await processMeeting('m1', deps, () => 1751979219000);
     expect(outcome).toEqual({ kind: 'completed' });
     const txtUpload = fakes.upload.mock.calls.find((c) => c[0] === 'meetings/m1/transcript/transcript-v1.txt');
-    expect(txtUpload?.[1]).toBe('[Dr. Patel] hello world [Speaker 2] second speaker');
+    expect(txtUpload?.[1]).toBe('[Dr. Patel] hello world\n\n[Speaker 2] second speaker');
   });
 });

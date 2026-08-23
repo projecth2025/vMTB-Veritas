@@ -33,3 +33,31 @@ export function assignSpeakers(
 export function speakerLabel(labels: Map<string, string>, participantId: string | null): string {
   return (participantId && labels.get(participantId)) || 'Unknown';
 }
+
+export interface SpeakerLine {
+  speaker: string;
+  text: string;
+}
+
+/**
+ * Merge consecutive segments from the same speaker into single flowing
+ * utterances. The streaming STT commits small fragments (with occasional
+ * echo artifacts); stitching them per speaker turns the raw segment list
+ * into readable paragraphs for artifacts and MoM prompts.
+ */
+export function groupBySpeaker(
+  segments: SegmentRow[],
+  labels: Map<string, string>,
+): SpeakerLine[] {
+  const lines: SpeakerLine[] = [];
+  for (const s of [...segments].sort((a, b) => (a.start_time ?? 0) - (b.start_time ?? 0))) {
+    const speaker = speakerLabel(labels, s.participant_id);
+    const last = lines[lines.length - 1];
+    if (last && last.speaker === speaker) {
+      last.text = `${last.text} ${s.text}`.replace(/\s+/g, ' ').trim();
+    } else {
+      lines.push({ speaker, text: s.text });
+    }
+  }
+  return lines;
+}

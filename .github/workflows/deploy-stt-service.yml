@@ -104,7 +104,7 @@ jobs:
             --timeout 3600 \
             --no-allow-unauthenticated \
             --no-gpu-zonal-redundancy \
-            --set-env-vars "STT_MODEL=medium,STT_DEVICE=cuda,STT_COMPUTE_TYPE=float16"
+            --set-env-vars "STT_MODEL=medium,STT_DEVICE=cuda,STT_COMPUTE_TYPE=float16,STT_MIN_COMMIT_WORDS=12"
 
       - name: Show service URL
         run: |
