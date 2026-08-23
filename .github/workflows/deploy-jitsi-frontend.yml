@@ -25,9 +25,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: jitsi-frontend
     steps:
       - uses: actions/checkout@v4
 
@@ -37,8 +34,14 @@ jobs:
           cache: npm
           cache-dependency-path: jitsi-frontend/package-lock.json
 
-      - run: npm ci
+      - name: Install dependencies
+        working-directory: jitsi-frontend
+        run: npm ci
 
+      # Runs from the REPO ROOT on purpose: the Vercel project's dashboard
+      # settings already define Root Directory = jitsi-frontend, and the CLI
+      # appends it relative to the current path. Invoking it from inside the
+      # subdirectory would double it (jitsi-frontend/jitsi-frontend).
       - name: Deploy to Vercel (production)
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
