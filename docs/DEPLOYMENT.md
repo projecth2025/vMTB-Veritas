@@ -677,14 +677,15 @@ You will need ready: `<ACT_URL>` (§4), `<VM_IP>` (§6.2), Supabase URL + anon k
    apply after a rebuild.
 3. **Allow-list the Vercel origin on the activation backend (required)** —
    the loader calls `/start-jitsi` straight from the browser, and the
-   backend's CORS list doesn't include your new Vercel URL by default:
+   backend's CORS list doesn't include your new Vercel URL by default.
+   Note the `\,` escapes — gcloud splits env values on bare commas:
    ```bash
    gcloud run services update jitsi-activation-backend \
      --project YOUR_PROJECT_ID --region asia-southeast1 \
-     --update-env-vars CORS_ORIGINS="https://vmtb-jitsi.vercel.app,https://www.vmtb.in,https://server.vmtb.in,http://localhost:5173"
+     --update-env-vars "CORS_ORIGINS=https://vmtb-jitsi.vercel.app\,https://www.vmtb.in\,https://server.vmtb.in\,http://localhost:5173"
    ```
-   (use your real Vercel URL; takes effect on the next request — no redeploy
-   needed since Cloud Run restarts the container on env updates)
+   Takes effect on the next request. The deploy workflow merges env vars on
+   redeploys, so this setting survives pressing the button again.
 
 ### 7.4 Final frontend checklist
 

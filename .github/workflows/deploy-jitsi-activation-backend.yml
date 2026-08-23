@@ -89,6 +89,17 @@ jobs:
       # /start-jitsi directly, exactly like the previous Render deployment.
       - name: Deploy to Cloud Run
         run: |
+          ENV_VARS="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=asia-south1-c,JITSI_INSTANCE_NAME=jitsi-vm,GCP_REGION=$REGION,STT_SERVICE_NAME=stt-service,PROXY_SERVICE_NAME=opus-transcriber-proxy"
+
+          # Merge env vars on later deploys so manually added ones (e.g.
+          # CORS_ORIGINS, see docs/DEPLOYMENT.md §7.3) survive redeploys.
+          if gcloud run services describe "$SERVICE" \
+               --project "$PROJECT_ID" --region "$REGION" >/dev/null 2>&1; then
+            ENV_FLAG="--update-env-vars"
+          else
+            ENV_FLAG="--set-env-vars"
+          fi
+
           gcloud run deploy "$SERVICE" \
             --project "$PROJECT_ID" \
             --region "$REGION" \
@@ -98,7 +109,7 @@ jobs:
             --min-instances 0 \
             --max-instances 3 \
             --timeout 120 \
-            --set-env-vars "GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=asia-south1-c,JITSI_INSTANCE_NAME=jitsi-vm,GCP_REGION=$REGION,STT_SERVICE_NAME=stt-service,PROXY_SERVICE_NAME=opus-transcriber-proxy"
+            "$ENV_FLAG" "$ENV_VARS"
 
       - name: Show service URL
         run: |
