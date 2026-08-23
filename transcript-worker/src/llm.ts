@@ -1,5 +1,6 @@
 import logger from './logger.js';
 import type { SegmentRow } from './supabase.js';
+import { assignSpeakers, speakerLabel } from './speakers.js';
 
 export interface LlmConfig {
   provider: string;
@@ -33,7 +34,10 @@ export async function generateMom(
     return null;
   }
 
-  const transcriptText = segments.map((s) => `[${fmtTime(s.start_time)}] ${s.text}`).join('\n');
+  const labels = assignSpeakers(segments);
+  const transcriptText = segments
+    .map((s) => `[${fmtTime(s.start_time)}] [${speakerLabel(labels, s.participant_id)}] ${s.text}`)
+    .join('\n');
   const prompt = buildPrompt(transcriptText);
 
   const url = `${config.baseUrl.replace(/\/$/, '')}/chat/completions`;
@@ -52,10 +56,17 @@ export async function generateMom(
           {
             role: 'system',
             content:
-              'You are a medical tumor board meeting summarizer. Produce STRICT JSON ' +
-              'with keys: summary (string), decisions (array of strings), ' +
-              'action_items (array of objects {owner, task}), discussion_points ' +
-              '(array of strings). Never invent details not present in the transcript.',
+              'You are a meticulous meeting-minutes writer. You receive a raw, noisy ' +
+              'auto-generated transcript from a team meeting (often a molecular tumor ' +
+              'board, but summarize ANY topic faithfully). Produce STRICT JSON with keys: ' +
+              'summary (string; concise account of what was actually said), decisions ' +
+              '(array of strings), action_items (array of objects {owner, task}), ' +
+              'discussion_points (array of strings). Use only facts present in the ' +
+              'transcript; never invent names, cases, numbers or outcomes. Clean up ' +
+              'stuttered/repeated fragments into readable sentences and attribute points ' +
+              'to speakers where the labels allow. If the transcript contains no ' +
+              'meaningful content, write a one-sentence summary saying so and leave the ' +
+              'arrays empty.',
           },
           { role: 'user', content: prompt },
         ],
@@ -99,8 +110,8 @@ export async function generateMom(
 
 function buildPrompt(transcriptText: string): string {
   return (
-    'Here is the transcript of a molecular tumor board meeting (participant-tagged, ' +
-    'timestamps in seconds):\n\n' +
+    'Here is the transcript of a meeting (timestamped, speaker-labeled - speaker ' +
+    'names are auto-assigned channel labels, not real names):\n\n' +
     transcriptText +
     '\n\nSummarize this meeting as the structured JSON described by your system message.'
   );
