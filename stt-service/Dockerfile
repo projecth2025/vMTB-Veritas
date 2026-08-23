@@ -10,9 +10,15 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir uv && uv pip install --no-cache-dir --system -r requirements.txt
 
 RUN if [ "$STT_DEVICE" = "gpu" ]; then \
-      pip install --no-cache-dir nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12 && \
-      echo "/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib" >> /etc/ld.so.conf.d/cuda.conf && \
-      echo "/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib" >> /etc/ld.so.conf.d/cuda.conf && \
+      pip install --no-cache-dir \
+        nvidia-cuda-runtime-cu12 \
+        nvidia-cudnn-cu12 \
+        nvidia-cublas-cu12 \
+        nvidia-cuda-nvrtc-cu12 \
+        nvidia-cufft-cu12 && \
+      for d in /usr/local/lib/python3.11/site-packages/nvidia/*/lib; do \
+        echo "$d" >> /etc/ld.so.conf.d/cuda.conf; \
+      done && \
       ldconfig; \
     fi
 
