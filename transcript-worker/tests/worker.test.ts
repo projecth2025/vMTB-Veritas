@@ -64,7 +64,7 @@ describe('processMeeting', () => {
     );
     expect(fakes.upload).toHaveBeenCalledWith(
       'meetings/m1/transcript/transcript-v1.txt',
-      'hello world second speaker',
+      '[Speaker 1] hello world [Speaker 2] second speaker',
       'text/plain',
     );
     expect(fakes.complete).toHaveBeenCalledWith('m1', 'meetings/m1/transcript/transcript-v1.json', 1, null);
@@ -148,13 +148,16 @@ describe('processMeeting', () => {
 });
 
 describe('buildArtifact', () => {
-  it('builds a versioned artifact with ordered text', () => {
+  it('builds a versioned artifact with speaker labels and ordered text', () => {
     const artifact = buildArtifact('m1', segments, () => 1751979219000);
     expect(artifact.schema).toBe('vmtb-transcript/1');
     expect(artifact.version).toBe(1);
     expect(artifact.meeting_id).toBe('m1');
     expect(artifact.segment_count).toBe(2);
-    expect(artifact.text).toBe('hello world second speaker');
+    // p1 appears first -> Speaker 1; p2 second -> Speaker 2
+    expect(artifact.segments[0]!.speaker).toBe('Speaker 1');
+    expect(artifact.segments[1]!.speaker).toBe('Speaker 2');
+    expect(artifact.text).toBe('[Speaker 1] hello world [Speaker 2] second speaker');
     expect(artifact.generated_at).toBe(new Date(1751979219000).toISOString());
   });
 

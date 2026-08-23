@@ -3,6 +3,7 @@ import type { SupabaseStore, SegmentRow } from './supabase.js';
 import type { GcsClient } from './gcs.js';
 import type { LlmConfig } from './llm.js';
 import { generateMom } from './llm.js';
+import { assignSpeakers, speakerLabel } from './speakers.js';
 
 export const TRANSCRIPT_VERSION = 1;
 
@@ -25,6 +26,7 @@ export interface TranscriptArtifact {
   segment_count: number;
   segments: Array<{
     participant_id: string;
+    speaker: string;
     start_time: number | null;
     end_time: number | null;
     text: string;
@@ -83,8 +85,10 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
 }
 
 export function buildArtifact(meetingId: string, segments: SegmentRow[], now = Date.now): TranscriptArtifact {
+  const labels = assignSpeakers(segments);
   const normalized = segments.map((s) => ({
     participant_id: s.participant_id,
+    speaker: speakerLabel(labels, s.participant_id),
     start_time: s.start_time,
     end_time: s.end_time,
     text: s.text,
@@ -97,6 +101,6 @@ export function buildArtifact(meetingId: string, segments: SegmentRow[], now = D
     generated_at: new Date(now()).toISOString(),
     segment_count: normalized.length,
     segments: normalized,
-    text: normalized.map((s) => s.text).join(' ').trim(),
+    text: normalized.map((s) => `[${s.speaker}] ${s.text}`).join(' ').trim(),
   };
 }
