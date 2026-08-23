@@ -28,15 +28,16 @@ export async function generateMom(
   segments: SegmentRow[],
   config: LlmConfig,
   fetchImpl: typeof fetch = fetch,
+  labels?: Map<string, string>,
 ): Promise<MomResult | null> {
   if (!config.apiKey || config.provider === 'none') {
     logger.info('llm: not configured, skipping MoM generation');
     return null;
   }
 
-  const labels = assignSpeakers(segments);
+  const resolved = labels ?? assignSpeakers(segments);
   const transcriptText = segments
-    .map((s) => `[${fmtTime(s.start_time)}] [${speakerLabel(labels, s.participant_id)}] ${s.text}`)
+    .map((s) => `[${fmtTime(s.start_time)}] [${speakerLabel(resolved, s.participant_id)}] ${s.text}`)
     .join('\n');
   const prompt = buildPrompt(transcriptText);
 
