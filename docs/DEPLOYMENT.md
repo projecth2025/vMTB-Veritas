@@ -273,11 +273,13 @@ Deploy strictly in this order:
 Then collect the URLs you'll need later:
 
 ```bash
-gcloud run services list --project YOUR_PROJECT_ID
+YOUR_PROJECT_ID=vmtb-new
+
+gcloud run services list --project $YOUR_PROJECT_ID
 PROXY_URL=$(gcloud run services describe opus-transcriber-proxy \
-  --project YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
+  --project $YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
 ACT_URL=$(gcloud run services describe jitsi-activation-backend \
-  --project YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
+  --project $YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
 echo "PROXY=$PROXY_URL"; echo "ACT=$ACT_URL"
 ```
 
@@ -576,13 +578,23 @@ You will need ready: `<ACT_URL>` (§4), `<VM_IP>` (§6.2), Supabase URL + anon k
 8. Click **Create Static Site**. Watch the *Events* tab — first build takes
    ~2–4 min. When it says *Live*, open `https://vmtb-main.onrender.com`:
    you should see the vMTB login page. Log in with a real account to confirm
-   Supabase connectivity.
+   Supabase connectivity. *(Google login won't work until step 9.)*
+
+9. **Allow-list the site in Supabase (required for Google OAuth)** — Supabase
+   redirects users back to whatever *Site URL* is configured there, **not**
+   to wherever you deployed; unlisted origins silently fall back to that old
+   Site URL. In Supabase Dashboard → **Authentication → URL Configuration**:
+   - **Site URL**: `https://vmtb-main.onrender.com`
+   - **Redirect URLs**: add `https://vmtb-main.onrender.com/**`; keep
+     `http://localhost:5173/**` for dev; delete stale domains from previous
+     deployments
+   - Save — takes effect immediately, no redeploy needed.
 
 **C. Wire up CI/CD**
 
-9. Service page → **Settings** → scroll to **Deploy Hook** → copy the URL
-   (looks like `https://api.render.com/deploy/srv-...?key=...`).
-10. Add it as the GitHub secret `RENDER_DEPLOY_HOOK` (§2.7).
+10. Service page → **Settings** → scroll to **Deploy Hook** → copy the URL
+    (looks like `https://api.render.com/deploy/srv-...?key=...`).
+11. Add it as the GitHub secret `RENDER_DEPLOY_HOOK` (§2.7).
 
     From now on, **Actions → Deploy main app (Render)** triggers a fresh
     build. (Render also auto-deploys on every push to the branch by default;
@@ -755,6 +767,7 @@ ws.on("message", (m) => console.log(m.toString()));
 | WebSocket drops at exactly 60 min | Cloud Run hard cap; proxy/STT reconnect automatically — acceptable for MVP |
 | CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend, redeploy |
 | Meeting iframe blank / external_api.js fails to load | the self-signed cert wasn't accepted in that browser yet — visit `https://<VM_IP>` directly and proceed past the warning (§8 step 2) |
+| Google OAuth lands on an old/wrong domain | Supabase **Site URL / Redirect URLs** still point there — fix per §7.1 step 9 |
 | Render site 404s on refresh / deep links | missing SPA rewrite rule `/* → /index.html` (§7.1 step 4) |
 | Frontend shows old backend URLs after env change | `VITE_*` vars bake at build time — trigger the deploy button again |
 | Vercel workflow fails auth | wrong/expired `VERCEL_TOKEN`, or org/project ids swapped |
