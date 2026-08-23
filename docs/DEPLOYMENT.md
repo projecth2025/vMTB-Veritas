@@ -153,7 +153,8 @@ gcloud iam service-accounts add-iam-policy-binding \
 
 # deployer SA: what GitHub Actions may do
 for ROLE in roles/run.admin roles/iam.serviceAccountUser roles/artifactregistry.writer \
-            roles/cloudbuild.builds.builder roles/storage.objectAdmin roles/secretmanager.viewer; do
+            roles/cloudbuild.builds.builder roles/storage.objectAdmin roles/secretmanager.viewer \
+            roles/pubsub.editor; do
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:vmtb-deployer@$PROJECT_ID.iam.gserviceaccount.com" --role="$ROLE"
 done
@@ -272,11 +273,13 @@ Deploy strictly in this order:
 Then collect the URLs you'll need later:
 
 ```bash
-gcloud run services list --project YOUR_PROJECT_ID
+YOUR_PROJECT_ID=vmtb-new
+
+gcloud run services list --project $YOUR_PROJECT_ID
 PROXY_URL=$(gcloud run services describe opus-transcriber-proxy \
-  --project YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
+  --project $YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
 ACT_URL=$(gcloud run services describe jitsi-activation-backend \
-  --project YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
+  --project $YOUR_PROJECT_ID --region asia-southeast1 --format 'value(status.url)')
 echo "PROXY=$PROXY_URL"; echo "ACT=$ACT_URL"
 ```
 
@@ -575,13 +578,23 @@ You will need ready: `<ACT_URL>` (§4), `<VM_IP>` (§6.2), Supabase URL + anon k
 8. Click **Create Static Site**. Watch the *Events* tab — first build takes
    ~2–4 min. When it says *Live*, open `https://vmtb-main.onrender.com`:
    you should see the vMTB login page. Log in with a real account to confirm
-   Supabase connectivity.
+   Supabase connectivity. *(Google login won't work until step 9.)*
+
+9. **Allow-list the site in Supabase (required for Google OAuth)** — Supabase
+   redirects users back to whatever *Site URL* is configured there, **not**
+   to wherever you deployed; unlisted origins silently fall back to that old
+   Site URL. In Supabase Dashboard → **Authentication → URL Configuration**:
+   - **Site URL**: `https://vmtb-main.onrender.com`
+   - **Redirect URLs**: add `https://vmtb-main.onrender.com/**`; keep
+     `http://localhost:5173/**` for dev; delete stale domains from previous
+     deployments
+   - Save — takes effect immediately, no redeploy needed.
 
 **C. Wire up CI/CD**
 
-9. Service page → **Settings** → scroll to **Deploy Hook** → copy the URL
-   (looks like `https://api.render.com/deploy/srv-...?key=...`).
-10. Add it as the GitHub secret `RENDER_DEPLOY_HOOK` (§2.7).
+10. Service page → **Settings** → scroll to **Deploy Hook** → copy the URL
+    (looks like `https://api.render.com/deploy/srv-...?key=...`).
+11. Add it as the GitHub secret `RENDER_DEPLOY_HOOK` (§2.7).
 
     From now on, **Actions → Deploy main app (Render)** triggers a fresh
     build. (Render also auto-deploys on every push to the branch by default;
@@ -662,6 +675,22 @@ You will need ready: `<ACT_URL>` (§4), `<VM_IP>` (§6.2), Supabase URL + anon k
    §7.2 (e.g. `https://vmtb-jitsi.vercel.app`) → **Save Changes**.
 2. Trigger **Actions → Deploy main app (Render)** — env var changes only
    apply after a rebuild.
+3. **Allow-list the Vercel origin on the activation backend (required)** —
+   the loader calls `/start-jitsi` straight from the browser, and the
+   backend's CORS list doesn't include your new Vercel URL by default.
+   Use an env-vars file — gcloud splits inline values on commas, which
+   makes multi-origin lists painful to escape:
+   ```bash
+   cat > /tmp/cors.yaml <<'EOF'
+   CORS_ORIGINS: "https://vmtb-jitsi.vercel.app,https://www.vmtb.in,https://server.vmtb.in,http://localhost:5173"
+   EOF
+
+   gcloud run services update jitsi-activation-backend \
+     --project YOUR_PROJECT_ID --region asia-southeast1 \
+     --env-vars-file /tmp/cors.yaml
+   ```
+   Takes effect on the next request. The deploy workflow merges env vars on
+   redeploys, so this setting survives pressing the button again.
 
 ### 7.4 Final frontend checklist
 
@@ -749,10 +778,13 @@ ws.on("message", (m) => console.log(m.toString()));
 | Segments never appear in Supabase | proxy secrets wrong (`supabase-url` / `supabase-service-role-key`); check proxy logs for store errors |
 | Worker never runs; status stuck PENDING | push subscription broken — rerun the transcript-worker workflow (it repairs it) |
 | Worker wiring step fails with `unrecognized arguments: --push-auth-token` | old workflow version — latest wires the subscription via OIDC only (`--push-auth-service-account`); pull and re-run |
+| Worker wiring step fails with `User not authorized` (subscriptions) | CI deployer lacks Pub/Sub rights — grant `roles/pubsub.editor` to `vmtb-deployer@…` (§2.3), re-run the button |
 | Meeting FAILED with LLM error | bad/expired Mistral key → fix `llm-api-key` secret, redeploy worker |
 | WebSocket drops at exactly 60 min | Cloud Run hard cap; proxy/STT reconnect automatically — acceptable for MVP |
-| CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend, redeploy |
+| CORS error in browser console | add frontend origin to `CORS_ORIGINS` env of activation backend (§7.3 step 3), redeploy |
+| Loader shows "Network error (CORS or server down)" when starting a meeting | same as above — your Vercel origin is missing from the activation backend's `CORS_ORIGINS` |
 | Meeting iframe blank / external_api.js fails to load | the self-signed cert wasn't accepted in that browser yet — visit `https://<VM_IP>` directly and proceed past the warning (§8 step 2) |
+| Google OAuth lands on an old/wrong domain | Supabase **Site URL / Redirect URLs** still point there — fix per §7.1 step 9 |
 | Render site 404s on refresh / deep links | missing SPA rewrite rule `/* → /index.html` (§7.1 step 4) |
 | Frontend shows old backend URLs after env change | `VITE_*` vars bake at build time — trigger the deploy button again |
 | Vercel workflow fails auth | wrong/expired `VERCEL_TOKEN`, or org/project ids swapped |
