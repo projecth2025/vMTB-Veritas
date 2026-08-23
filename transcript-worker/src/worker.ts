@@ -61,7 +61,20 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
 
   try {
     const segments = await deps.supabase.fetchSegments(meetingId);
-    const artifact = buildArtifact(meetingId, segments, now);
+
+    // Resolve opaque participant tags to display names (best effort).
+    let nameMap = new Map<string, string | null>();
+    try {
+      nameMap = await deps.supabase.resolveParticipantNames(segments);
+    } catch (err) {
+      logger.warn(
+        { meetingId, err: err instanceof Error ? err.message : String(err) },
+        'worker: name resolution failed; using Speaker N labels',
+      );
+    }
+    const labels = assignSpeakers(segments, nameMap);
+
+    const artifact = buildArtifact(meetingId, segments, now, labels);
 
     const objectKey = `meetings/${meetingId}/transcript/transcript-v${TRANSCRIPT_VERSION}.json`;
     await deps.gcs.upload(objectKey, JSON.stringify(artifact, null, 2), 'application/json');
@@ -71,7 +84,7 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
       'text/plain',
     );
 
-    const mom = await generateMom(segments, deps.llm);
+    const mom = await generateMom(segments, deps.llm, undefined, labels);
 
     await deps.supabase.complete(meetingId, objectKey, TRANSCRIPT_VERSION, mom);
     logger.info({ meetingId, segments: segments.length, mom: Boolean(mom) }, 'worker: meeting completed');
@@ -84,11 +97,16 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
   }
 }
 
-export function buildArtifact(meetingId: string, segments: SegmentRow[], now = Date.now): TranscriptArtifact {
-  const labels = assignSpeakers(segments);
+export function buildArtifact(
+  meetingId: string,
+  segments: SegmentRow[],
+  now: () => number = Date.now,
+  labels?: Map<string, string>,
+): TranscriptArtifact {
+  const resolved = labels ?? assignSpeakers(segments);
   const normalized = segments.map((s) => ({
     participant_id: s.participant_id,
-    speaker: speakerLabel(labels, s.participant_id),
+    speaker: speakerLabel(resolved, s.participant_id),
     start_time: s.start_time,
     end_time: s.end_time,
     text: s.text,

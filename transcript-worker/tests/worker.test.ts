@@ -29,6 +29,7 @@ function makeDeps(overrides: Partial<WorkerDeps> = {}): { deps: WorkerDeps; fake
   const fakes = {
     claim: vi.fn().mockResolvedValue({ meeting_id: 'm1', status: 'PENDING', transcript_object_key: null, error_message: null }),
     fetchSegments: vi.fn().mockResolvedValue(segments),
+    resolveParticipantNames: vi.fn().mockResolvedValue(new Map<string, string | null>()),
     complete: vi.fn().mockResolvedValue(undefined),
     fail: vi.fn().mockResolvedValue(undefined),
     upload: vi.fn().mockResolvedValue(undefined),
@@ -38,6 +39,7 @@ function makeDeps(overrides: Partial<WorkerDeps> = {}): { deps: WorkerDeps; fake
     supabase: {
       claim: fakes.claim,
       fetchSegments: fakes.fetchSegments,
+      resolveParticipantNames: fakes.resolveParticipantNames,
       complete: fakes.complete,
       fail: fakes.fail,
     } as never,
@@ -161,9 +163,34 @@ describe('buildArtifact', () => {
     expect(artifact.generated_at).toBe(new Date(1751979219000).toISOString());
   });
 
+  it('prefers resolved display names over numbered speakers', () => {
+    const labels = new Map([
+      ['p1', 'Dr. Patel'],
+      ['p2', 'Dr. Lee'],
+    ]);
+    const artifact = buildArtifact('m1', segments, () => 1, labels);
+    expect(artifact.segments[0]!.speaker).toBe('Dr. Patel');
+    expect(artifact.segments[1]!.speaker).toBe('Dr. Lee');
+    expect(artifact.text).toBe('[Dr. Patel] hello world [Dr. Lee] second speaker');
+  });
+
   it('handles empty segment lists', () => {
     const artifact = buildArtifact('m1', [], () => 1);
     expect(artifact.segment_count).toBe(0);
     expect(artifact.text).toBe('');
+  });
+
+  it('resolves display names during processing and uses them in artifacts', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.resolveParticipantNames.mockResolvedValue(
+      new Map([
+        ['p1', 'Dr. Patel'],
+        ['p2', null], // unresolved -> falls back to Speaker N
+      ]),
+    );
+    const outcome = await processMeeting('m1', deps, () => 1751979219000);
+    expect(outcome).toEqual({ kind: 'completed' });
+    const txtUpload = fakes.upload.mock.calls.find((c) => c[0] === 'meetings/m1/transcript/transcript-v1.txt');
+    expect(txtUpload?.[1]).toBe('[Dr. Patel] hello world [Speaker 2] second speaker');
   });
 });
