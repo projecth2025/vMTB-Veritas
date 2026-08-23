@@ -3,7 +3,7 @@ import type { SupabaseStore, SegmentRow } from './supabase.js';
 import type { GcsClient } from './gcs.js';
 import type { LlmConfig } from './llm.js';
 import { generateMom } from './llm.js';
-import { assignSpeakers, speakerLabel } from './speakers.js';
+import { assignSpeakers, groupBySpeaker, speakerLabel } from './speakers.js';
 
 export const TRANSCRIPT_VERSION = 1;
 
@@ -112,6 +112,8 @@ export function buildArtifact(
     text: s.text,
     provider: s.provider,
   }));
+  // Readable form: consecutive same-speaker fragments stitched into paragraphs.
+  const lines = groupBySpeaker(segments, resolved);
   return {
     schema: 'vmtb-transcript/1',
     meeting_id: meetingId,
@@ -119,6 +121,6 @@ export function buildArtifact(
     generated_at: new Date(now()).toISOString(),
     segment_count: normalized.length,
     segments: normalized,
-    text: normalized.map((s) => `[${s.speaker}] ${s.text}`).join(' ').trim(),
+    text: lines.map((l) => `[${l.speaker}] ${l.text}`).join('\n\n'),
   };
 }

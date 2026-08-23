@@ -1,6 +1,6 @@
 import logger from './logger.js';
 import type { SegmentRow } from './supabase.js';
-import { assignSpeakers, speakerLabel } from './speakers.js';
+import { assignSpeakers, groupBySpeaker } from './speakers.js';
 
 export interface LlmConfig {
   provider: string;
@@ -36,9 +36,10 @@ export async function generateMom(
   }
 
   const resolved = labels ?? assignSpeakers(segments);
-  const transcriptText = segments
-    .map((s) => `[${fmtTime(s.start_time)}] [${speakerLabel(resolved, s.participant_id)}] ${s.text}`)
-    .join('\n');
+  const lines = groupBySpeaker(segments, resolved);
+  const transcriptText = lines
+    .map((l) => `[${l.speaker}] ${l.text}`)
+    .join('\n\n');
   const prompt = buildPrompt(transcriptText);
 
   const url = `${config.baseUrl.replace(/\/$/, '')}/chat/completions`;
@@ -59,15 +60,17 @@ export async function generateMom(
             content:
               'You are a meticulous meeting-minutes writer. You receive a raw, noisy ' +
               'auto-generated transcript from a team meeting (often a molecular tumor ' +
-              'board, but summarize ANY topic faithfully). Produce STRICT JSON with keys: ' +
-              'summary (string; concise account of what was actually said), decisions ' +
-              '(array of strings), action_items (array of objects {owner, task}), ' +
-              'discussion_points (array of strings). Use only facts present in the ' +
-              'transcript; never invent names, cases, numbers or outcomes. Clean up ' +
-              'stuttered/repeated fragments into readable sentences and attribute points ' +
-              'to speakers where the labels allow. If the transcript contains no ' +
-              'meaningful content, write a one-sentence summary saying so and leave the ' +
-              'arrays empty.',
+              'board, but summarize ANY topic faithfully). The transcript comes from ' +
+              'streaming speech recognition: expect stutters, repeated phrases, mid-word ' +
+              'cuts and imperfect grammar. Silently clean these up and extract the actual ' +
+              'meaning - do NOT dismiss the content as noise unless it contains no words ' +
+              'at all. Produce STRICT JSON with keys: summary (string; concise account of ' +
+              'what was actually said), decisions (array of strings), action_items (array ' +
+              'of objects {owner, task}), discussion_points (array of strings). Use only ' +
+              'facts present in the transcript; never invent names, cases, numbers or ' +
+              'outcomes. Attribute points to speakers where the labels allow. If the ' +
+              'transcript is completely empty, write a one-sentence summary saying so and ' +
+              'leave the arrays empty.',
           },
           { role: 'user', content: prompt },
         ],
