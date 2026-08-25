@@ -19,6 +19,10 @@ on:
         description: "Image tag (default: git short sha)"
         required: false
         default: ""
+      region:
+        description: "Deployment region (asia-south1 requires invite-only L4 access)"
+        required: false
+        default: "asia-southeast1"
 
 permissions:
   contents: read
@@ -30,7 +34,7 @@ concurrency:
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  REGION: asia-southeast1 # must be a Cloud Run GPU region (L4)
+  REGION: ${{ github.event.inputs.region || 'asia-southeast1' }} # must be a Cloud Run GPU region (L4)
   REPO: vmtb-services
   SERVICE: stt-service
   RUNTIME_SA: vmtb-services # runtime service account (name only)
@@ -100,11 +104,11 @@ jobs:
             --cpu 4 \
             --concurrency 1 \
             --min-instances 0 \
-            --max-instances 2 \
+            --max-instances 1 \
             --timeout 3600 \
             --no-allow-unauthenticated \
             --no-gpu-zonal-redundancy \
-            --set-env-vars "STT_MODEL=medium,STT_DEVICE=cuda,STT_COMPUTE_TYPE=float16,STT_MIN_COMMIT_WORDS=12"
+            --set-env-vars "STT_MODEL=medium,STT_DEVICE=cuda,STT_COMPUTE_TYPE=float16,STT_MIN_COMMIT_WORDS=12,STT_IDLE_TIMEOUT_SECONDS=300"
 
       - name: Show service URL
         run: |

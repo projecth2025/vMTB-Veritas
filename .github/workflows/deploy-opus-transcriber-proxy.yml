@@ -15,6 +15,10 @@ on:
         description: "Image tag (default: git short sha)"
         required: false
         default: ""
+      stt_region:
+        description: "Region where stt-service is deployed (for STT_WS_URL wiring)"
+        required: false
+        default: "asia-southeast1"
 
 permissions:
   contents: read
@@ -86,11 +90,12 @@ jobs:
       # Abuse surface is limited by the sessionId validation + length cap.
       - name: Deploy to Cloud Run
         run: |
+          STT_REGION="${{ inputs.stt_region || 'asia-southeast1' }}"
           STT_URL=$(gcloud run services describe stt-service \
-            --project "$PROJECT_ID" --region "$REGION" \
+            --project "$PROJECT_ID" --region "$STT_REGION" \
             --format 'value(status.url)' 2>/dev/null || true)
           if [ -z "$STT_URL" ]; then
-            echo "::warning::stt-service not found in $REGION - deploy it first; continuing with empty STT_WS_URL"
+            echo "::warning::stt-service not found in $STT_REGION - deploy it first; continuing with empty STT_WS_URL"
           fi
           STT_WS_URL="${STT_URL/https:/wss:}/client/ws/speech"
 
