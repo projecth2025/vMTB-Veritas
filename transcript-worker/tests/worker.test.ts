@@ -30,6 +30,7 @@ function makeDeps(overrides: Partial<WorkerDeps> = {}): { deps: WorkerDeps; fake
     claim: vi.fn().mockResolvedValue({ meeting_id: 'm1', status: 'PENDING', transcript_object_key: null, error_message: null }),
     fetchSegments: vi.fn().mockResolvedValue(segments),
     resolveParticipantNames: vi.fn().mockResolvedValue(new Map<string, string | null>()),
+    hasActiveSession: vi.fn().mockResolvedValue(false),
     complete: vi.fn().mockResolvedValue(undefined),
     fail: vi.fn().mockResolvedValue(undefined),
     upload: vi.fn().mockResolvedValue(undefined),
@@ -40,11 +41,13 @@ function makeDeps(overrides: Partial<WorkerDeps> = {}): { deps: WorkerDeps; fake
       claim: fakes.claim,
       fetchSegments: fakes.fetchSegments,
       resolveParticipantNames: fakes.resolveParticipantNames,
+      hasActiveSession: fakes.hasActiveSession,
       complete: fakes.complete,
       fail: fakes.fail,
     } as never,
     gcs,
     llm: { provider: 'none', baseUrl: '', apiKey: '', model: 'gpt-4o-mini' },
+    vm: { activatorUrl: '' },
     ...overrides,
   };
   return { deps, fakes };
@@ -194,3 +197,58 @@ describe('buildArtifact', () => {
     expect(txtUpload?.[1]).toBe('[Dr. Patel] hello world\n\n[Speaker 2] second speaker');
   });
 });
+describe('automatic VM stop', () => {
+  const ACT = 'https://activator.example';
+
+  function withFetch(fn: typeof fetch): void {
+    vi.stubGlobal('fetch', fn);
+  }
+
+  it('is disabled when JITSI_ACTIVATOR_URL is empty', async () => {
+    const { deps } = makeDeps(); // vm.activatorUrl = ''
+    const spy = vi.fn();
+    withFetch(spy as unknown as typeof fetch);
+    await processMeeting('m1', deps, () => 1751979219000);
+    expect(spy).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it('fires /stop-jitsi when the room is quiet', async () => {
+    const { deps } = makeDeps({ vm: { activatorUrl: ACT } });
+    fakesHas(deps, false);
+    const spy = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    withFetch(spy as unknown as typeof fetch);
+    const outcome = await processMeeting('m1', deps, () => 1751979219000);
+    expect(outcome).toEqual({ kind: 'completed' });
+    expect(spy).toHaveBeenCalledWith(
+      `${ACT}/stop-jitsi`,
+      expect.objectContaining({ method: 'POST' }),
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it('skips the stop while another session is live', async () => {
+    const { deps, fakes } = makeDeps({ vm: { activatorUrl: ACT } });
+    fakes.hasActiveSession.mockResolvedValue(true);
+    const spy = vi.fn();
+    withFetch(spy as unknown as typeof fetch);
+    await processMeeting('m1', deps, () => 1751979219000);
+    expect(fakes.hasActiveSession).toHaveBeenCalled();
+    expect(spy).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it('does not fail the meeting when the stop call throws', async () => {
+    const { deps } = makeDeps({ vm: { activatorUrl: ACT } });
+    fakesHas(deps, false);
+    withFetch(vi.fn().mockRejectedValue(new Error('boom')) as unknown as typeof fetch);
+    const outcome = await processMeeting('m1', deps, () => 1751979219000);
+    expect(outcome).toEqual({ kind: 'completed' });
+    vi.unstubAllGlobals();
+  });
+});
+
+function fakesHas(deps: WorkerDeps, value: boolean): void {
+  (deps.supabase as unknown as { hasActiveSession: ReturnType<typeof vi.fn> })
+    .hasActiveSession.mockResolvedValue(value);
+}

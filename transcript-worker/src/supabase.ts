@@ -65,6 +65,23 @@ export class SupabaseStore {
   }
 
   /**
+   * True when any analytics session (written by jitsi-frontend) has sent a
+   * heartbeat recently - i.e. someone is in a meeting right now. Used as the
+   * safety valve before tearing the Jitsi VM down.
+   */
+  async hasActiveSession(withinMinutes = 3): Promise<boolean> {
+    const cutoff = new Date(Date.now() - withinMinutes * 60_000).toISOString();
+    const { data, error } = await this.client
+      .from('meeting_sessions')
+      .select('id')
+      .eq('status', 'active')
+      .gte('last_heartbeat', cutoff)
+      .limit(1);
+    if (error) throw new Error(`hasActiveSession: ${error.message}`);
+    return (data ?? []).length > 0;
+  }
+
+  /**
    * Resolve opaque JVB transcription tags ("9f4a4375-a0") to human display
    * names using the participant records written by jitsi-frontend analytics.
    *

@@ -778,10 +778,17 @@ gcloud run services describe stt-service --project YOUR_PROJECT_ID \
 - Orphan protection: the STT service closes WebSocket sessions after
   `STT_IDLE_TIMEOUT_SECONDS` (default 300s) of silence, so a crashed client
   cannot hold the GPU for the full request timeout.
-- The Jitsi VM still bills while RUNNING: stop it after testing via
-  `curl -X POST $ACT_URL/stop-jitsi`.
-- Safety net — auto-stop the VM nightly at midnight IST (Cloud Run services
-  self-reap; only the VM needs this):
+- The Jitsi VM **stops itself now**: the transcript-worker fires
+  `POST $ACT_URL/stop-jitsi` after every processed meeting, but only when no
+  analytics session has heartbeated in the last 3 minutes (so it never kills a
+  live or newer meeting). Requires the loader's Supabase analytics to be
+  running — it is, automatically. Watch for `vm: /stop-jitsi fired
+  successfully` in worker logs. The nightly scheduler below remains as an
+  optional backup for days with zero processed meetings.
+- ⚠️ Frequent VM stop/start cycles change its ephemeral external IP. While
+  your meeting URL is an sslip.io hostname that IP is baked into the name —
+  either reserve a static IP (~₹10/day, billed whenever attached *or* idle)
+  or move to `meet.vmtb.in` (§6.7). Safety net if you skip this:
   ```bash
   gcloud scheduler jobs create http vmtb-nightly-stop \
     --location=asia-south1 \

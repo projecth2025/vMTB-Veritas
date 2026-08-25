@@ -21,6 +21,10 @@ export interface Config {
   llmBaseUrl: string;
   llmApiKey: string;
   llmModel: string;
+
+  // Automatic VM teardown: after processing a completed meeting the worker
+  // POSTs {url}/stop-jitsi (only when no other session is live). Empty = off.
+  jitsiActivatorUrl: string;
 }
 
 export function loadConfig(): Config {
@@ -49,6 +53,7 @@ export function loadConfig(): Config {
     llmProvider: opt('LLM_PROVIDER', 'none'),
     llmBaseUrl: opt('LLM_BASE_URL', ''),
     llmApiKey: opt('LLM_API_KEY', ''),
-    llmModel: opt('LLM_MODEL', 'gpt-4o-mini'),
+    llmModel: opt('LLM_MODEL', 'mistral-small-latest'),
+    jitsiActivatorUrl: opt('JITSI_ACTIVATOR_URL', ''),
   };
 }

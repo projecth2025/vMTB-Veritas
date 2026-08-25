@@ -84,6 +84,15 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
+          # Auto-VM-stop hook: the worker POSTs /stop-jitsi here after every
+          # processed meeting (guarded by live-session checks).
+          ACT_URL=$(gcloud run services describe jitsi-activation-backend \
+            --project "$PROJECT_ID" --region "$REGION" \
+            --format 'value(status.url)' 2>/dev/null || true)
+          if [ -z "$ACT_URL" ]; then
+            echo "::warning::jitsi-activation-backend not found; automatic VM stop will be disabled"
+          fi
+
           gcloud run deploy "$SERVICE" \
             --project "$PROJECT_ID" \
             --region "$REGION" \
@@ -93,7 +102,7 @@ jobs:
             --min-instances 0 \
             --max-instances 5 \
             --timeout 300 \
-            --set-env-vars "GCS_BUCKET=vmtb-transcripts,GCP_PROJECT_ID=$PROJECT_ID,LLM_PROVIDER=mistral,LLM_BASE_URL=https://api.mistral.ai/v1,LLM_MODEL=mistral-small-latest" \
+            --set-env-vars "GCS_BUCKET=vmtb-transcripts,GCP_PROJECT_ID=$PROJECT_ID,LLM_PROVIDER=mistral,LLM_BASE_URL=https://api.mistral.ai/v1,LLM_MODEL=mistral-small-latest,JITSI_ACTIVATOR_URL=$ACT_URL" \
             --set-secrets "SUPABASE_URL=supabase-url:latest,SUPABASE_SERVICE_ROLE_KEY=supabase-service-role-key:latest,LLM_API_KEY=llm-api-key:latest"
 
       - name: Show service URL
