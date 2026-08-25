@@ -34,8 +34,12 @@ export class SelfHostedSTTProvider implements STTProvider {
   private retryAttempt = 0;
 
   constructor(private options: SelfHostedOptions) {
-    this.maxRetries = options.maxRetries ?? 2;
-    this.retryDelayMs = options.retryDelayMs ?? 1000;
+    // Defaults sized for a scale-to-zero GPU backend: a cold Cloud Run
+    // instance may take 1-2 minutes (boot + model load) before the WebSocket
+    // is accepted, so retries must outlast the cold start. Cumulative backoff
+    // with these numbers covers roughly 4 minutes.
+    this.maxRetries = options.maxRetries ?? 8;
+    this.retryDelayMs = options.retryDelayMs ?? 2000;
   }
 
   connect(): Promise<void> {

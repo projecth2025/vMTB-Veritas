@@ -141,8 +141,15 @@ for ROLE in roles/run.invoker roles/storage.objectAdmin roles/secretmanager.secr
     --member="serviceAccount:vmtb-services@$PROJECT_ID.iam.gserviceaccount.com" --role="$ROLE"
 done
 
-# activator SA: control the VM + wake/sleep Cloud Run services
-for ROLE in roles/compute.instanceAdmin.v1 roles/run.developer roles/run.invoker; do
+# activator SA: start/stop the VM, probe Cloud Run services.
+# NOTE: read-only + invoker on purpose. The activation backend never writes
+# Cloud Run scaling configuration (a former min-instances patching design
+# left an idle L4 GPU resident and dominated our bill). If you are upgrading
+# an older deployment, revoke roles/run.developer from vmtb-activator:
+#   gcloud projects remove-iam-policy-binding "$PROJECT_ID" \
+#     --member="serviceAccount:vmtb-activator@$PROJECT_ID.iam.gserviceaccount.com" \
+#     --role="roles/run.developer"
+for ROLE in roles/compute.instanceAdmin.v1 roles/run.viewer roles/run.invoker; do
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:vmtb-activator@$PROJECT_ID.iam.gserviceaccount.com" --role="$ROLE"
 done
@@ -753,10 +760,28 @@ ws.on("message", (m) => console.log(m.toString()));
 
 ## 9. Keeping costs near zero between meetings
 
-- All Cloud Run services run `--min-instances 0` → free while idle.
-- Woken GPU ≈ **$0.70–1.00/hr**; VM ≈ e2-standard-4 hourly rate while RUNNING.
-- Always stop after testing: `curl -X POST $ACT_URL/stop-jitsi`.
-- Safety net — auto-stop every night at midnight IST:
+The GPU STT service is **request-driven scale-to-zero**: no meetings → zero
+instances → zero cost. The activation backend only *probes* services (which
+starts a cold instance) and never patches min-instances — an earlier design
+that set `min-instances=1` during meetings left an idle L4 resident for days
+(~₹56/hr) and dominated the bill. Do not reintroduce scaling writes; if you
+suspect a resident instance, check:
+
+```bash
+gcloud run services describe stt-service --project YOUR_PROJECT_ID \
+  --region asia-southeast1 --format='value(spec.template.metadata.annotations)'
+# run.googleapis.com/minScale must be absent or '0'
+```
+
+- GPU billing = entire instance lifetime (instance-based). A cold start adds
+  ~1–2 min of billable time before the first word is transcribed — accepted.
+- Orphan protection: the STT service closes WebSocket sessions after
+  `STT_IDLE_TIMEOUT_SECONDS` (default 300s) of silence, so a crashed client
+  cannot hold the GPU for the full request timeout.
+- The Jitsi VM still bills while RUNNING: stop it after testing via
+  `curl -X POST $ACT_URL/stop-jitsi`.
+- Safety net — auto-stop the VM nightly at midnight IST (Cloud Run services
+  self-reap; only the VM needs this):
   ```bash
   gcloud scheduler jobs create http vmtb-nightly-stop \
     --location=asia-south1 \
@@ -765,6 +790,11 @@ ws.on("message", (m) => console.log(m.toString()));
   ```
   (enable Cloud Scheduler API if prompted)
 - Render static sites and Vercel hobby projects are free at this scale.
+- Cost audit after any test session: Console → Cloud Run → stt-service →
+  **Metrics** → `Billable instance time`. A 2-minute meeting should show
+  ~3–5 minutes of billable time (cold start + meeting), not hours.
+- Considering Mumbai for the STT service? See `docs/GPU_MUMBAI_ACCESS.md` —
+  L4 there is invite-only and GPU pricing is identical across regions.
 
 ---
 
