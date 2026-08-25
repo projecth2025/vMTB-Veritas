@@ -796,6 +796,37 @@ gcloud run services describe stt-service --project YOUR_PROJECT_ID \
 - Considering Mumbai for the STT service? See `docs/GPU_MUMBAI_ACCESS.md` —
   L4 there is invite-only and GPU pricing is identical across regions.
 
+### Tuning the Jitsi VM itself
+
+The default `e2-standard-4` (4 vCPU / 16 GB) is oversized for small boards.
+With the VM **stopped**:
+
+```bash
+gcloud compute instances set-machine-type jitsi-vm \
+  --zone=asia-south1-c --machine-type=e2-medium    # 2 vCPU/4GB, ~25% of the cost
+# safer: --machine-type=e2-standard-2               # 2 vCPU/8GB
+gcloud compute instances start jitsi-vm --zone=asia-south1-c
+```
+
+On `e2-medium`, cap the Java heaps (JVB ships a 3 GB heap by default):
+
+```bash
+sudo systemctl edit jitsi-videobridge2   # [Service] Environment="JAVA_TOOL_OPTIONS=-Xmx768m"
+sudo systemctl edit jicofo               # [Service] Environment="JAVA_TOOL_OPTIONS=-Xmx384m"
+sudo systemctl restart jitsi-videobridge2 jicofo && free -h
+```
+
+Notes:
+- A stopped VM still bills its boot disk (~₹50/month for 20 GB) — everything
+  else pauses. Disks can be grown but never shrunk.
+- ⚠️ While the meeting URL is an sslip.io hostname (§6.3), stopping/starting
+  the VM may change its ephemeral IP and break the hostname/cert/config trio.
+  Either complete §6.7 (real domain) first, or update DNS + re-run
+  `install-letsencrypt-cert.sh` after every IP change. A reserved static IP
+  (~₹10/day) avoids the churn at a price.
+- Undo: `set-machine-type … e2-standard-4` and remove the drop-ins with
+  `sudo systemctl revert jitsi-videobridge2 jicofo`.
+
 ---
 
 ## 10. Troubleshooting
