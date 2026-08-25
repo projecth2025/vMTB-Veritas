@@ -11,7 +11,12 @@ export interface WorkerDeps {
   supabase: SupabaseStore;
   gcs: GcsClient;
   llm: LlmConfig;
+  /** Teardown hook: when set, finished meetings stop the Jitsi VM. */
+  vm?: { activatorUrl: string };
 }
+
+/** Minutes of analytics silence that qualify the room as truly empty. */
+const VM_ACTIVE_GRACE_MINUTES = 3;
 
 export type Outcome =
   | { kind: 'completed' }
@@ -56,6 +61,7 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
 
   if (!claimed) {
     logger.info({ meetingId }, 'worker: already processed or unknown; acking');
+    await stopVmIfQuiet(meetingId, deps);
     return { kind: 'already-processed' };
   }
 
@@ -88,12 +94,62 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
 
     await deps.supabase.complete(meetingId, objectKey, TRANSCRIPT_VERSION, mom);
     logger.info({ meetingId, segments: segments.length, mom: Boolean(mom) }, 'worker: meeting completed');
+    await stopVmIfQuiet(meetingId, deps);
     return { kind: 'completed' };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     logger.error({ meetingId, err: error }, 'worker: processing failed, marking FAILED');
     await deps.supabase.fail(meetingId, error);
+    await stopVmIfQuiet(meetingId, deps);
     return { kind: 'failed', error };
+  }
+}
+
+/**
+ * Automatic VM teardown: once a meeting has been fully processed, ask the
+ * activation backend to stop the Jitsi VM so an idle machine never bills
+ * overnight. Never throws - a teardown failure must not affect the meeting's
+ * outcome (which is already recorded).
+ *
+ * Safety valve: if any analytics session still has a fresh heartbeat, someone
+ * is mid-meeting (perhaps a newer one) and the stop is skipped.
+ */
+export async function stopVmIfQuiet(meetingId: string, deps: WorkerDeps): Promise<void> {
+  const activatorUrl = deps.vm?.activatorUrl?.replace(/\/$/, '');
+  if (!activatorUrl) {
+    logger.debug({ meetingId }, 'vm: JITSI_ACTIVATOR_URL not set, skipping VM stop');
+    return;
+  }
+
+  try {
+    const active = await deps.supabase.hasActiveSession(VM_ACTIVE_GRACE_MINUTES);
+    if (active) {
+      logger.info({ meetingId }, 'vm: live session detected, skipping VM stop');
+      return;
+    }
+  } catch (err) {
+    logger.warn(
+      { meetingId, err: err instanceof Error ? err.message : String(err) },
+      'vm: active-session check failed, skipping VM stop conservatively',
+    );
+    return;
+  }
+
+  try {
+    const res = await fetch(`${activatorUrl}/stop-jitsi`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.ok) {
+      logger.info({ meetingId, status: res.status }, 'vm: /stop-jitsi fired successfully');
+    } else {
+      logger.warn({ meetingId, status: res.status }, 'vm: /stop-jitsi returned non-ok status');
+    }
+  } catch (err) {
+    logger.warn(
+      { meetingId, err: err instanceof Error ? err.message : String(err) },
+      'vm: /stop-jitsi call failed',
+    );
   }
 }
 

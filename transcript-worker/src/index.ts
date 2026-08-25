@@ -21,6 +21,7 @@ const deps: WorkerDeps = {
     apiKey: config.llmApiKey,
     model: config.llmModel,
   },
+  vm: { activatorUrl: config.jitsiActivatorUrl },
 };
 
 const server = createServer(config, {
