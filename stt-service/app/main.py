@@ -94,9 +94,21 @@ def create_app(transcriber: Transcriber | None = None, *, stt_settings=None) -> 
 
         last_run = time.monotonic()
         last_forced = last_run
+        idle_timeout = cfg.idle_timeout_seconds
         try:
             while True:
-                message = await ws.receive()
+                # Idle watchdog: a client that vanishes without a clean close
+                # would otherwise hold this (billable) GPU instance until the
+                # platform request timeout. Silence longer than the configured
+                # window ends the session; the final flush below still runs.
+                if idle_timeout > 0:
+                    try:
+                        message = await asyncio.wait_for(ws.receive(), timeout=idle_timeout)
+                    except asyncio.TimeoutError:
+                        logger.info("ws: idle timeout (%ss), closing session", idle_timeout)
+                        break
+                else:
+                    message = await ws.receive()
 
                 if message["type"] == "websocket.disconnect":
                     break

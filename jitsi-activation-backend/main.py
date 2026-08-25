@@ -6,24 +6,32 @@ Brings up (and tears down) every billable component a meeting needs:
   - ``stt-service``         Cloud Run GPU service, scale-to-zero
   - ``opus-transcriber-proxy``  Cloud Run service, scale-to-zero
 
-Scale-to-zero Cloud Run services are "woken" by raising their
-``min_instance_count`` from 0 to 1 and are considered ready once their health
-endpoint answers. Stopping lowers it back to 0 so nothing bills while idle.
+Cost model (important): this service NEVER writes Cloud Run scaling
+configuration. A previous design patched ``min_instance_count`` 0->1 before a
+meeting and back to 0 afterwards; when the "back to 0" step was forgotten, an
+idle L4 GPU stayed resident for days (~Rs 56/hour). Instead, scale-from-zero
+is driven purely by requests: each poll below issues an authenticated health
+probe, and that request itself starts the GPU instance if it is cold.
+Subsequent polls observe readiness, and Cloud Run reaps the instance by itself
+once the meeting's WebSocket closes and traffic stops.
 
 ``POST /start-jitsi`` is polled by jitsi-frontend every few seconds until it
 returns ``{"status": "already_running"}``, which means ALL components are up.
-The endpoint is idempotent: each poll re-checks state, only issues start
-requests for components that are not yet up, and never blocks for long.
+The endpoint is idempotent: each poll re-checks state and never blocks for
+long.
 
 Credentials come from Application Default Credentials (the service account
 attached to this Cloud Run service). For local development you can instead set
-``GCP_SERVICE_ACCOUNT_JSON`` to a full service-account JSON blob.
+``GCP_SERVICE_ACCOUNT_JSON`` to a full service-account JSON blob. The runtime
+service account needs only:
+  - Compute Engine instance start/stop/get on jitsi-vm
+  - roles/run.invoker on stt-service and opus-transcriber-proxy (probes)
+  - roles/run.viewer (to read the services' URLs)
 """
 
 import json
 import logging
 import os
-import time
 from typing import Any
 
 import google.auth
@@ -32,10 +40,8 @@ from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import compute_v1
-from google.cloud import run_v2
 from google.oauth2 import id_token as google_id_token
 from google.oauth2 import service_account
-from google.protobuf.field_mask_pb2 import FieldMask
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -83,11 +89,15 @@ class Config:
         self.proxy_service_name = os.environ.get(
             "PROXY_SERVICE_NAME", "opus-transcriber-proxy"
         )
-        # How long to remember that a wake patch was already issued, so rapid
-        # polling does not create a new revision on every call.
-        self.wake_guard_seconds = float(os.environ.get("WAKE_GUARD_SECONDS", "30"))
-        # Per-request timeout for health probes.
-        self.probe_timeout_seconds = float(os.environ.get("PROBE_TIMEOUT_SECONDS", "6"))
+        # Per-request timeout for health probes. A cold GPU STT blocks its
+        # first request while the container boots and the model loads; later
+        # polls succeed quickly once /ready answers.
+        self.stt_probe_timeout_seconds = float(
+            os.environ.get("STT_PROBE_TIMEOUT_SECONDS", "15")
+        )
+        self.proxy_probe_timeout_seconds = float(
+            os.environ.get("PROXY_PROBE_TIMEOUT_SECONDS", "8")
+        )
 
 
 cfg = Config()
@@ -97,12 +107,6 @@ cfg = Config()
 # ---------------------------------------------------------------------------
 
 _compute_client: compute_v1.InstancesClient | None = None
-_run_client: run_v2.ServicesClient | None = None
-
-# Guards against issuing duplicate wake/sleep patches while one is still being
-# applied by Cloud Run (polling happens every ~5s).
-_last_wake_at: dict[str, float] = {}
-_last_sleep_at: dict[str, float] = {}
 
 
 def _credentials():
@@ -122,56 +126,22 @@ def compute_client() -> compute_v1.InstancesClient:
     return _compute_client
 
 
-def run_client() -> run_v2.ServicesClient:
-    global _run_client
-    if _run_client is None:
-        _run_client = run_v2.ServicesClient(credentials=_credentials())
-    return _run_client
+def _service_url(service_name: str) -> str:
+    """Read a Cloud Run service URL via the Admin API (read-only)."""
+    from google.cloud import run_v2  # local import: only needed for reads
+
+    client = run_v2.ServicesClient(credentials=_credentials())
+    name = f"projects/{cfg.project_id}/locations/{cfg.region}/services/{service_name}"
+    return client.get_service(name=name).uri or ""
 
 
-def _service_resource_name(service_name: str) -> str:
-    return f"projects/{cfg.project_id}/locations/{cfg.region}/services/{service_name}"
+def probe(base_url: str, path: str, timeout_seconds: float) -> bool:
+    """GET a health endpoint, authenticating with an ID token when possible.
 
-
-def get_run_service(service_name: str) -> run_v2.Service:
-    return run_client().get_service(name=_service_resource_name(service_name))
-
-
-def min_instances(service: run_v2.Service) -> int:
-    scaling = getattr(service, "scaling", None)
-    count = getattr(scaling, "min_instance_count", 0) if scaling else 0
-    return count or 0
-
-
-def _patch_min_instances(service_name: str, target: int) -> bool:
-    """Set min_instance_count on a Cloud Run service.
-
-    Returns True when a patch was actually issued. A time guard prevents
-    hammering the API (and creating revisions) while polls arrive every 5s.
+    The probe doubles as the scale-from-zero trigger: Cloud Run starts an
+    instance to serve it. A cold STT instance may not answer within the first
+    few attempts (model load); callers simply poll again.
     """
-    guard = _last_wake_at if target >= 1 else _last_sleep_at
-    last = guard.get(service_name, 0.0)
-    if time.monotonic() - last < cfg.wake_guard_seconds:
-        log.info("%s: %s patch recently issued, skipping", service_name,
-                 "wake" if target >= 1 else "sleep")
-        return False
-
-    service = get_run_service(service_name)
-    if min_instances(service) == target:
-        return False
-
-    service.scaling.min_instance_count = target
-    run_client().update_service(
-        service=service,
-        update_mask=FieldMask(paths=["scaling"]),
-    )
-    guard[service_name] = time.monotonic()
-    log.info("%s: min_instances -> %d", service_name, target)
-    return True
-
-
-def probe(base_url: str, path: str) -> bool:
-    """GET a health endpoint, authenticating with an ID token when possible."""
     url = base_url.rstrip("/") + path
     headers: dict[str, str] = {}
     try:
@@ -182,7 +152,7 @@ def probe(base_url: str, path: str) -> bool:
         log.debug("id token fetch failed for %s (%s); trying unauthenticated", base_url, exc)
 
     try:
-        resp = httpx.get(url, headers=headers, timeout=cfg.probe_timeout_seconds)
+        resp = httpx.get(url, headers=headers, timeout=timeout_seconds)
         ok = resp.status_code == 200
         log.debug("probe %s -> %s", url, resp.status_code)
         return ok
@@ -233,18 +203,17 @@ def start_jitsi() -> dict[str, Any]:
         log.exception("jvb start check failed")
         components["jvb"] = {"state": "error", "detail": str(exc)}
 
-    # 2. Scale-to-zero Cloud Run services
+    # 2. Scale-to-zero Cloud Run services: the authenticated probe below is
+    # what starts a cold instance (request-driven wake). We deliberately do
+    # NOT touch min-instances - see the module docstring for the cost story.
     services = (
-        ("stt", cfg.stt_service_name, "/ready"),
-        ("proxy", cfg.proxy_service_name, "/health"),
+        ("stt", cfg.stt_service_name, "/ready", cfg.stt_probe_timeout_seconds),
+        ("proxy", cfg.proxy_service_name, "/health", cfg.proxy_probe_timeout_seconds),
     )
-    for key, name, health_path in services:
+    for key, name, health_path, probe_timeout in services:
         try:
-            service = get_run_service(name)
-            if min_instances(service) < 1:
-                _patch_min_instances(name, 1)
-            url = service.uri or ""
-            state = "ready" if (url and probe(url, health_path)) else "starting"
+            url = _service_url(name)
+            state = "ready" if (url and probe(url, health_path, probe_timeout)) else "starting"
             components[key] = {"state": state}
         except Exception as exc:  # noqa: BLE001
             log.exception("%s wake failed", name)
@@ -261,7 +230,13 @@ def start_jitsi() -> dict[str, Any]:
 
 @app.post("/stop-jitsi")
 def stop_jitsi() -> dict[str, Any]:
-    """Tear everything down so idle components stop billing."""
+    """Stop the billable VM.
+
+    The Cloud Run services are intentionally left alone: they are
+    request-driven and Cloud Run reaps their instances automatically once the
+    meeting's WebSockets close (the STT service additionally closes sessions
+    after an idle window). There is no resident-GPU state to clean up anymore.
+    """
     components: dict[str, dict[str, str]] = {}
 
     try:
@@ -279,27 +254,20 @@ def stop_jitsi() -> dict[str, Any]:
         components["jvb"] = {"state": "error", "detail": str(exc)}
 
     for key, name in (("stt", cfg.stt_service_name), ("proxy", cfg.proxy_service_name)):
-        try:
-            patched = _patch_min_instances(name, 0)
-            components[key] = {
-                "state": "stopping" if patched else "stopped",
-            }
-        except Exception as exc:  # noqa: BLE001
-            log.exception("%s sleep failed", name)
-            components[key] = {"state": "error", "detail": str(exc)}
+        components[key] = {"state": "scale-to-zero (automatic)"}
 
-    all_down = all(c["state"] in ("stopped",) for c in components.values())
+    all_down = components["jvb"]["state"] == "stopped"
     payload = {
         "status": "already_stopped" if all_down else "stopping",
         "components": components,
     }
-    log.info("/stop-jitsi -> %s %s", payload["status"], components)
+    log.info("/stop-jitsi -> %s", payload["status"])
     return payload
 
 
 @app.get("/status")
 def status() -> dict[str, Any]:
-    """Read-only view of every component (no side effects). For debugging."""
+    """Read-only view of every component (no side effects beyond probes). For debugging."""
     components: dict[str, dict[str, str]] = {}
     try:
         components["jvb"] = {"state": vm_status()}
@@ -311,12 +279,11 @@ def status() -> dict[str, Any]:
         ("proxy", cfg.proxy_service_name, "/health"),
     ):
         try:
-            service = get_run_service(name)
-            warm = min_instances(service) >= 1
-            healthy = warm and probe(service.uri or "", health_path)
+            url = _service_url(name)
+            healthy = bool(url) and probe(url, health_path, cfg.stt_probe_timeout_seconds)
             components[key] = {
-                "state": "ready" if healthy else ("warm" if warm else "cold"),
-                "url": service.uri or "",
+                "state": "ready" if healthy else "cold-or-starting",
+                "url": url,
             }
         except Exception as exc:  # noqa: BLE001
             components[key] = {"state": "error", "detail": str(exc)}

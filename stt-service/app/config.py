@@ -29,6 +29,11 @@ class Settings:
         # Maximum wall-clock time between transcription runs (seconds).
         self.max_between_runs_seconds = float(os.environ.get("STT_MAX_RUN_GAP_SECONDS", "5.0"))
 
+        # Close a WebSocket session after this many seconds of silence (no
+        # audio frames, no messages). Orphaned connections would otherwise
+        # hold a billable GPU instance until the platform timeout. 0 disables.
+        self.idle_timeout_seconds = float(os.environ.get("STT_IDLE_TIMEOUT_SECONDS", "300"))
+
         # Compute
         self.device = os.environ.get("STT_DEVICE", "auto")  # auto | cpu | cuda
         self.compute_type = os.environ.get("STT_COMPUTE_TYPE", "auto")  # auto | float16 | int8 | float32
