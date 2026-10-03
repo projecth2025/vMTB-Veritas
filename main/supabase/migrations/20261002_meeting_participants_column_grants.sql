@@ -27,8 +27,10 @@
 REVOKE INSERT, UPDATE ON public.meeting_participants FROM anon, authenticated;
 
 -- Exactly the columns jitsi-frontend's markParticipantLeft() sets. Notably NOT
--- updated_at: the client never writes it, and the table's updated_at trigger
--- runs as the table owner, so it needs no grant of its own.
+-- updated_at: the client never names it in its UPDATE, and Postgres checks
+-- column privileges only against the columns a statement names -- not against
+-- columns a BEFORE trigger assigns. So update_meeting_participants_updated_at
+-- still bumps updated_at on every leave update without a grant of its own.
 GRANT UPDATE (left_at, duration_seconds, left_reason)
     ON public.meeting_participants TO anon, authenticated;
 
