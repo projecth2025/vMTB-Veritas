@@ -31,9 +31,28 @@ export interface ServerStats {
  *   GET  /status   -> session stats (used to keep on-demand scaling decisions honest)
  *   WS   /transcribe?sessionId=...  -> JVB transcription endpoint
  */
+/**
+ * Verify shared secret token for JVB authentication.
+ * The JVB is configured with a shared secret in its URL template.
+ * Returns true if the token matches the expected secret.
+ */
+function verifySharedSecret(token: string, expectedSecret: string): boolean {
+  if (!expectedSecret) return true; // No secret configured = no auth (dev mode)
+  // Use timing-safe comparison to prevent timing attacks
+  if (token.length !== expectedSecret.length) return false;
+  let result = 0;
+  for (let i = 0; i < token.length; i++) {
+    result |= token.charCodeAt(i) ^ expectedSecret.charCodeAt(i);
+  }
+  return result === 0;
+}
+
 export function createServer(config: Config, deps: ServerDeps): { server: http.Server; stats: ServerStats; close: () => Promise<void> } {
   const sessions = new Map<string, TranscriberProxy>();
   const stats: ServerStats = { activeSessions: 0 };
+
+  // Shared secret for JVB authentication
+  const expectedSecret = config.jvbAuthSecret || '';
 
   // Shared warmer: one authenticated /ready ping loop while any session is open.
   const sttReadyUrl =
@@ -97,6 +116,38 @@ export function createServer(config: Config, deps: ServerDeps): { server: http.S
       return;
     }
 
+    // Verify shared secret token (from Authorization header or query param)
+    const authHeader = request.headers.authorization;
+    const tokenFromQuery = parsed.searchParams.get('token');
+    const token = authHeader?.startsWith('Bearer ') 
+      ? authHeader.slice(7) 
+      : tokenFromQuery;
+
+    // Check if token matches expected shared secret
+    if (expectedSecret) {
+      if (!token) {
+        logger.warn({ sessionId }, 'ws: rejecting connection, missing token');
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\nMissing authentication token');
+        socket.destroy();
+        return;
+      }
+
+      if (!verifySharedSecret(token, expectedSecret)) {
+        logger.warn({ sessionId }, 'ws: rejecting connection, invalid token');
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\nInvalid authentication token');
+        socket.destroy();
+        return;
+      }
+
+      logger.info({ sessionId }, 'ws: token verified');
+    } else {
+      logger.warn({ sessionId }, 'ws: no auth secret configured, allowing connection');
+    }
+
+    const sessionIdStr = sessionId;
+    proceedWithConnection(sessionIdStr);
+
+    function proceedWithConnection(sessionId: string): void {
     const providerName = (parsed.searchParams.get('provider') ?? config.provider) as ProviderName;
 
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -144,6 +195,7 @@ export function createServer(config: Config, deps: ServerDeps): { server: http.S
 
       logger.info({ sessionId, provider: providerName }, 'ws: transcription session opened');
     });
+    } // end proceedWithConnection
   });
 
   const close = async (): Promise<void> => {
