@@ -381,8 +381,6 @@ def status() -> dict[str, Any]:
             components[key] = {"state": "error", "detail": str(exc)}
 
     return {
-        "project": cfg.project_id,
-        "region": cfg.region,
         "jitsi_public_url": cfg.jitsi_public_url,
         "components": components,
     }

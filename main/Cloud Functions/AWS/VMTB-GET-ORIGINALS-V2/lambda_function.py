@@ -1,5 +1,7 @@
 import json
+import os
 import re
+from typing import Any, Optional
 
 import boto3
 
@@ -33,11 +35,19 @@ def extract_page_number(name: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+
 def lambda_handler(event, context):
     try:
         params = event.get("queryStringParameters") or {}
         request_id = params.get("request_id")
         document_name = params.get("document_name")
+        # Optional auth placeholder — reads Authorization header but never rejects.
+        # Full JWT validation will be added in a future PR.
+        auth_header = event.get("headers", {}).get("authorization", "")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[len("Bearer "):]
+            # Token format check only; no rejection for missing/invalid tokens yet.
+            _ = bool(token)
 
         if not request_id or not document_name:
             return response(400, {"error": "request_id and document_name are required"})
