@@ -39,6 +39,28 @@ a meeting: within the same delivery it re-checks live-session heartbeats for
 up to ~4 minutes (so tab-close ghosts age out) and retries transient stop
 failures — the activator returns 5xx if the GCP stop itself fails.
 
+**Auth.** All three endpoints return 401 without a valid caller (`/` stays
+open for health checks):
+
+- `/start-jitsi` and `/status` take the meeting **join ticket** in an
+  `X-Join-Ticket` header (jitsi-frontend sends it); the backend looks it up
+  in `meeting_join_tickets` and rejects expired ones.
+- `/stop-jitsi` takes **only** a Google ID token (`Authorization: Bearer`)
+  minted by transcript-worker for audience `JITSI_ACTIVATOR_URL`. A join
+  ticket is refused there, or any participant could end everyone's meeting.
+
+Backend config, set on the Cloud Run service (the deploy workflow merges env
+vars, so these survive redeploys; a fresh service needs them added by hand,
+and without them every call gets 401): `SUPABASE_URL`,
+`SUPABASE_SERVICE_ROLE_KEY` (secret ref `supabase-service-role-key`),
+`WORKER_SERVICE_ACCOUNT` (`vmtb-services@vmtb-new.iam.gserviceaccount.com`,
+the SA transcript-worker runs as) and `JITSI_ACTIVATOR_URL` (the backend's
+own run.app URL, same value as on the worker). Self-check:
+`python jitsi-activation-backend/check_auth.py`.
+
+To stop the VM by hand, skip the endpoint:
+`gcloud compute instances stop jitsi-vm --zone asia-south1-c --project vmtb-new`.
+
 **Note on Prosody WebSocket diagnostics:** a bare `curl` upgrade to
 `/xmpp-websocket` without `Sec-WebSocket-Protocol: xmpp` gets
 `501 Not Implemented` from Prosody by design — that is not a server fault.

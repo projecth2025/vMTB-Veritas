@@ -218,10 +218,10 @@ when done.
    cd jitsi-frontend && cp .env.production .env.development && npm install && npm run dev
    # then point main/src/services/meeting.ts's Jitsi URL at http://localhost:5174
    ```
-5. **Stop the VM when done**, using your activation backend's actual URL —
-   verify it in `docs/CLOUD_INVENTORY.md` rather than assuming a hostname:
+5. **Stop the VM when done** (`/stop-jitsi` only accepts the
+   transcript-worker's ID token, so stop it directly):
    ```bash
-   curl -X POST <ACTIVATION_BACKEND_URL>/stop-jitsi
+   gcloud compute instances stop jitsi-vm --zone asia-south1-c --project vmtb-new
    ```
 
 **What this validates:** case → MTB → meeting orchestration, VM start/stop,
