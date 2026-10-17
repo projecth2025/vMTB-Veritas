@@ -636,14 +636,18 @@ From your laptop:
 
 ```bash
 ACT_URL=<your activation backend URL>
-curl -s "$ACT_URL/status" | python3 -m json.tool
+TICKET=<the ticket= value from a meeting link the main app opened>
+curl -s "$ACT_URL/status" -H "X-Join-Ticket: $TICKET" | python3 -m json.tool
 # expect: jvb TERMINATED, stt cold, proxy cold
 
-curl -s -X POST "$ACT_URL/start-jitsi"
+curl -s -X POST "$ACT_URL/start-jitsi" -H "X-Join-Ticket: $TICKET"
 # repeat every few seconds until ALL components say "ready"
-# then tear back down:
-curl -s -X POST "$ACT_URL/stop-jitsi"
+# then tear back down (/stop-jitsi only accepts the worker's ID token):
+gcloud compute instances stop jitsi-vm --zone asia-south1-c --project vmtb-new
 ```
+
+All three endpoints return 401 without a valid caller; see "Auth" in
+`docs/JITSI_VM_OPERATIONS.md`.
 
 If `jvb` shows `error`, re-check §2.3 IAM bindings and the activation
 backend's Cloud Run logs.
@@ -891,8 +895,8 @@ Do this exactly once, in order, and note anything that breaks.
     - `minutes_of_meeting` column filled with Gemini JSON
      (summary / decisions / action_items).
 7. **Tear down**
-   `curl -X POST $ACT_URL/stop-jitsi` then confirm `/status` shows all
-   stopped/cold. **Never skip this** — the warm GPU bills ~$0.80/hr.
+   `gcloud compute instances stop jitsi-vm --zone asia-south1-c --project vmtb-new`
+   then confirm `/status` shows all stopped/cold. **Never skip this** — the warm GPU bills ~$0.80/hr.
 
 Pipeline smoke test without a real meeting (dummy provider, no GPU):
 
@@ -944,8 +948,11 @@ gcloud run services describe stt-service --project YOUR_PROJECT_ID \
   gcloud scheduler jobs create http vmtb-nightly-stop \
     --location=asia-south1 \
     --schedule="30 18 * * *" --time-zone="Asia/Kolkata" \
-    --uri="$ACT_URL/stop-jitsi" --http-method=POST
+    --uri="$ACT_URL/stop-jitsi" --http-method=POST \
+    --oidc-service-account-email=vmtb-services@vmtb-new.iam.gserviceaccount.com \
+    --oidc-token-audience="$ACT_URL"
   ```
+  (`/stop-jitsi` only accepts a `vmtb-services` ID token for that audience.)
   (enable Cloud Scheduler API if prompted)
 - Render static sites and Vercel hobby projects are free at this scale.
 - Cost audit after any test session: Console → Cloud Run → stt-service →

@@ -92,7 +92,8 @@ jobs:
           ENV_VARS="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=asia-south1-c,JITSI_INSTANCE_NAME=jitsi-vm,GCP_REGION=$REGION,STT_SERVICE_NAME=stt-service,PROXY_SERVICE_NAME=opus-transcriber-proxy,JITSI_PUBLIC_URL=https://server-vmtb-v2.3billionpairs.com,JITSI_PROBE_TIMEOUT_SECONDS=5"
 
           # Merge env vars on later deploys so manually added ones (e.g.
-          # CORS_ORIGINS, see docs/DEPLOYMENT.md §7.3) survive redeploys.
+          # CORS_ORIGINS, see docs/DEPLOYMENT.md §7.3, and the auth config in
+          # docs/JITSI_VM_OPERATIONS.md "Auth") survive redeploys.
           if gcloud run services describe "$SERVICE" \
                --project "$PROJECT_ID" --region "$REGION" >/dev/null 2>&1; then
             ENV_FLAG="--update-env-vars"

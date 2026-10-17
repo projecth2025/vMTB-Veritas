@@ -216,10 +216,31 @@ export async function stopVmIfQuiet(meetingId: string, deps: WorkerDeps): Promis
   }
 
   // Phase 2: POST /stop-jitsi, retrying transient failures within the budget.
+  // Fetch a Google ID token for authentication.
+  let idToken: string | null = null;
+  try {
+    const { GoogleAuth } = await import('google-auth-library');
+    const auth = new GoogleAuth();
+    // Audience is the activator URL (Cloud Run service URL)
+    const client = await auth.getIdTokenClient(activatorUrl);
+    const tokenResponse = await client.getAccessToken();
+    idToken = tokenResponse.token ?? null;
+  } catch (err) {
+    logger.warn(
+      { meetingId, err: err instanceof Error ? err.message : String(err) },
+      'vm: failed to fetch ID token, proceeding without auth',
+    );
+  }
+
   for (;;) {
     try {
+      const headers: Record<string, string> = {};
+      if (idToken) {
+        headers['Authorization'] = `Bearer ${idToken}`;
+      }
       const res = await fetch(`${activatorUrl}/stop-jitsi`, {
         method: 'POST',
+        headers,
         signal: AbortSignal.timeout(15_000),
       });
       if (res.ok) {
