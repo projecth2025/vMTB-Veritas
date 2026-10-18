@@ -217,14 +217,19 @@ export async function stopVmIfQuiet(meetingId: string, deps: WorkerDeps): Promis
 
   // Phase 2: POST /stop-jitsi, retrying transient failures within the budget.
   // Fetch a Google ID token for authentication.
-  let idToken: string | null = null;
+  let authHeaders: Record<string, string> = {};
   try {
     const { GoogleAuth } = await import('google-auth-library');
     const auth = new GoogleAuth();
-    // Audience is the activator URL (Cloud Run service URL)
+    // Get ID token client for the activator URL audience
     const client = await auth.getIdTokenClient(activatorUrl);
-    const tokenResponse = await client.getAccessToken();
-    idToken = tokenResponse.token ?? null;
+    // getRequestHeaders returns a Headers object with Authorization
+    const headers = await client.getRequestHeaders();
+    const authHeader = headers.get('Authorization');
+    if (authHeader) {
+      authHeaders = { Authorization: authHeader };
+      logger.info({ meetingId }, 'vm: fetched ID token for /stop-jitsi');
+    }
   } catch (err) {
     logger.warn(
       { meetingId, err: err instanceof Error ? err.message : String(err) },
@@ -234,13 +239,9 @@ export async function stopVmIfQuiet(meetingId: string, deps: WorkerDeps): Promis
 
   for (;;) {
     try {
-      const headers: Record<string, string> = {};
-      if (idToken) {
-        headers['Authorization'] = `Bearer ${idToken}`;
-      }
       const res = await fetch(`${activatorUrl}/stop-jitsi`, {
         method: 'POST',
-        headers,
+        headers: authHeaders,
         signal: AbortSignal.timeout(15_000),
       });
       if (res.ok) {
