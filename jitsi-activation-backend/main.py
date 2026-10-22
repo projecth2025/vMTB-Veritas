@@ -271,8 +271,14 @@ def verify_join_ticket(ticket: str) -> Optional[dict]:
             "user_id": row.get("user_id"),
             "mtb_id": row.get("mtb_id"),
         }
-    except Exception:
+    except Exception as exc:
+        log.warning("join-ticket verification failed: %s", exc)
         return None
+
+
+# Missing auth config is a per-process condition - log it once loudly instead
+# of once per request.
+_auth_config_warned = False
 
 
 def verify_google_id_token(token: str) -> Optional[dict]:
@@ -280,18 +286,22 @@ def verify_google_id_token(token: str) -> Optional[dict]:
 
     Returns {"email": ..., "sub": ...} if valid, None otherwise.
     """
+    global _auth_config_warned
     expected_email = os.environ.get("WORKER_SERVICE_ACCOUNT", "")
     # Must equal the worker's JITSI_ACTIVATOR_URL (the audience it mints for).
     # Without it, any token for the same SA (proxy, Pub/Sub push) would pass.
     expected_audience = os.environ.get("JITSI_ACTIVATOR_URL", "")
 
     if not expected_email or not expected_audience:
+        if not _auth_config_warned:
+            log.error(
+                "WORKER_SERVICE_ACCOUNT and/or JITSI_ACTIVATOR_URL not set - "
+                "every worker ID token will be rejected (see docs/JITSI_VM_OPERATIONS.md 'Auth')"
+            )
+            _auth_config_warned = True
         return None
 
     try:
-        from google.oauth2 import id_token as google_id_token
-        from google.auth.transport.requests import Request as GoogleAuthRequest
-
         # Verify the token
         idinfo = google_id_token.verify_oauth2_token(
             token,
@@ -302,13 +312,17 @@ def verify_google_id_token(token: str) -> Optional[dict]:
         # Check email matches expected service account
         email = idinfo.get("email", "")
         if email != expected_email or not idinfo.get("email_verified"):
+            log.warning("id-token rejected: email=%r email_verified=%r", email, idinfo.get("email_verified"))
             return None
 
         return {
             "email": email,
             "sub": idinfo.get("sub"),
         }
-    except Exception:
+    except Exception as exc:
+        # Never log the token - just why Google refused it (expired, wrong
+        # audience, unparseable). Without this, 401 storms were silent here.
+        log.warning("id-token verification failed: %s", exc)
         return None
 
 

@@ -89,7 +89,7 @@ jobs:
       # /start-jitsi directly, exactly like the previous Render deployment.
       - name: Deploy to Cloud Run
         run: |
-          ENV_VARS="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=asia-south1-c,JITSI_INSTANCE_NAME=jitsi-vm,GCP_REGION=$REGION,STT_SERVICE_NAME=stt-service,PROXY_SERVICE_NAME=opus-transcriber-proxy,JITSI_PUBLIC_URL=https://server-vmtb-v2.3billionpairs.com,JITSI_PROBE_TIMEOUT_SECONDS=5"
+          ENV_VARS="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=asia-south1-c,JITSI_INSTANCE_NAME=jitsi-vm,GCP_REGION=$REGION,STT_SERVICE_NAME=stt-service,PROXY_SERVICE_NAME=opus-transcriber-proxy,JITSI_PUBLIC_URL=https://server-vmtb-v2.3billionpairs.com,JITSI_PROBE_TIMEOUT_SECONDS=5,WORKER_SERVICE_ACCOUNT=vmtb-services@${PROJECT_ID}.iam.gserviceaccount.com"
 
           # Merge env vars on later deploys so manually added ones (e.g.
           # CORS_ORIGINS, see docs/DEPLOYMENT.md §7.3, and the auth config in
@@ -117,3 +117,15 @@ jobs:
           gcloud run services describe "$SERVICE" \
             --project "$PROJECT_ID" --region "$REGION" \
             --format 'value(status.url)'
+
+      # verify_google_id_token requires audience=JITSI_ACTIVATOR_URL, and the
+      # worker mints the token for its own JITSI_ACTIVATOR_URL - both derived
+      # from this service's URL. Hand-set values (Oct 2026) would otherwise be
+      # the only thing keeping auth working, so make every deploy self-heal it.
+      - name: Persist auth env vars
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" \
+            --project "$PROJECT_ID" --region "$REGION" --format 'value(status.url)')
+          gcloud run services update "$SERVICE" \
+            --project "$PROJECT_ID" --region "$REGION" \
+            --update-env-vars "JITSI_ACTIVATOR_URL=${URL}"

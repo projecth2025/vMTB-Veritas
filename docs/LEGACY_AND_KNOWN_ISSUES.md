@@ -230,6 +230,53 @@ the only freshness mechanism members have. Owners and their coordinators are
 unaffected — `useCaseRunState` already polls their own case detail (4s while
 a run is active, 30s idle, visibility-aware).
 
+## Resolved incidents
+
+- **RESOLVED 2026-10-22 — transcript-worker reprocessing loop + 401 storm
+  (Oct 17–22, 2026).** One already-COMPLETED meeting
+  (`e057eb54-517e-4fdf-b549-3172f8d7cf19`, completed 2026-10-17) was fully
+  reprocessed on **every** Pub/Sub redelivery — 969 deliveries on 2026-10-22
+  alone, each doing two GCS uploads, a Vertex LLM MoM call, and a
+  `/stop-jitsi` POST that the backend rejected with 401. The 401s kept both
+  Cloud Run services warm around the clock for days. Three causes stacked:
+
+  1. **`claim_meeting_transcript` reports "no row" as a truthy object.**
+     The LANGUAGE-sql `UPDATE … RETURNING *` function answers with a composite
+     where every column is `NULL` when no PENDING row matched; PostgREST
+     serializes that as `{"meeting_id": null, …}` — **truthy in JS**, so the
+     store's `if (!data)` guard treated an unclaimed meeting as claimed and
+     the worker's `if (!claimed)` saw a row. Fix (no SQL change — PostgREST
+     will always serialize a NULL composite this way): `SupabaseStore.claim()`
+     and `processMeeting()` now require `row.meeting_id` to be non-null.
+  2. **The worker POSTed `/stop-jitsi` unauthenticated by design.** The
+     deployed image (8208676, from `d9940f7`) called `client.getAccessToken()`
+     on an `IdTokenClient` — that method lives on `OAuth2Client`, sees no
+     `refresh_token`, and *always* throws "No refresh token or refresh handler
+     callback is set."; the catch block then logged "proceeding without auth"
+     and posted anyway. The correct call is `getRequestHeaders()` (local
+     `6373d81`, later merged upstream as PR #59). Additionally the backend's
+     `verify_google_id_token` swallowed every exception into a bare
+     `return None`, so the loop was invisible in logs. Fixes: the token mint
+     is now an injectable dep that **never posts without a token**, 4xx
+     responses (except 408/429) are terminal instead of retried for the whole
+     budget, and the backend logs verification failures and missing
+     `WORKER_SERVICE_ACCOUNT`/`JITSI_ACTIVATOR_URL` config (once per process).
+  3. **Nothing bounded redelivery.** The subscription had no dead-letter
+     topic and `ack-deadline=60` (a single delivery legitimately runs up to
+     ~4 min of live-session re-checks), so messages bounced mid-flight. The
+     deploy workflow now sets `ack-deadline=300`, a
+     `meeting-transcripts-dead-letter` topic, and `--max-delivery-attempts=5`.
+
+  Also fixed as a contributing factor: the worker Dockerfile's runtime stage
+  copied only `package.json`, so `npm ci` fell back to `npm install` and
+  drifted pinned versions in the image (build stage already copied the
+  lockfile; runtime stage now does too).
+
+  Immediate mitigation (already applied): the backlog was drained and then
+  `gcloud pubsub subscriptions seek meeting-transcripts-worker
+  --time=2026-10-22T17:56:07Z` reset the subscription — zero deliveries and
+  zero backend 401s afterwards.
+
 ## Stale documentation left in place (per user decision, flagged not edited)
 
 Per-service `README.md` files were deliberately left untouched during this
