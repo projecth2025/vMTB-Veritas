@@ -66,6 +66,9 @@ function makeDeps(overrides: Partial<WorkerDeps> = {}): { deps: WorkerDeps; fake
     stopMaxWaitMs: 0,
     stopPollIntervalMs: 0,
     sleep: () => Promise.resolve(),
+    // Tests never mint real ID tokens (no ADC in CI); the real mint lives in
+    // defaultFetchIdToken and is covered by its own absence in prod.
+    fetchIdToken: vi.fn().mockResolvedValue('Bearer test-token'),
     ...overrides,
   };
   return { deps, fakes };
@@ -101,6 +104,26 @@ describe('processMeeting', () => {
     expect(outcome).toEqual({ kind: 'already-processed' });
     expect(fakes.fetchSegments).not.toHaveBeenCalled();
     expect(fakes.complete).not.toHaveBeenCalled();
+  });
+
+  // Regression: PostgREST serializes a no-match RETURNS table function as an
+  // all-nulls object (truthy!). Treating it as claimed reprocessed one
+  // COMPLETED meeting on every redelivery - GCS + Vertex LLM calls per push.
+  it('treats an all-nulls claim row (no PENDING match) as already-processed', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.claim.mockResolvedValue({
+      id: null,
+      meeting_id: null,
+      status: null,
+      transcript_object_key: null,
+      error_message: null,
+    });
+    const outcome = await processMeeting('m1', deps);
+    expect(outcome).toEqual({ kind: 'already-processed' });
+    expect(fakes.fetchSegments).not.toHaveBeenCalled();
+    expect(fakes.upload).not.toHaveBeenCalled();
+    expect(fakes.complete).not.toHaveBeenCalled();
+    expect(fakes.fail).not.toHaveBeenCalled();
   });
 
   it('marks FAILED and acks when GCS upload fails', async () => {
@@ -442,6 +465,91 @@ describe('automatic VM stop', () => {
     withFetch(vi.fn().mockRejectedValue(new Error('boom')) as unknown as typeof fetch);
     const outcome = await processMeeting('m1', deps, () => 1751979219000);
     expect(outcome).toEqual({ kind: 'completed' });
+    vi.unstubAllGlobals();
+  });
+
+  it('sends the ID token as the Authorization header', async () => {
+    const { deps } = makeDeps({ vm: { activatorUrl: ACT } });
+    fakesHas(deps, false);
+    const spy = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    withFetch(spy as unknown as typeof fetch);
+    await processMeeting('m1', deps, () => 1751979219000);
+    expect(deps.fetchIdToken).toHaveBeenCalledWith(ACT);
+    expect(spy).toHaveBeenCalledWith(
+      `${ACT}/stop-jitsi`,
+      expect.objectContaining({ headers: { Authorization: 'Bearer test-token' } }),
+    );
+    vi.unstubAllGlobals();
+  });
+
+  // Fail-closed: a tokenless POST is a guaranteed 401 - the exact pattern that
+  // kept both Cloud Run services warm in a loop for days in Oct 2026.
+  it('never POSTs when the ID token cannot be minted', async () => {
+    const { deps } = makeDeps({
+      vm: { activatorUrl: ACT },
+      fetchIdToken: vi.fn().mockRejectedValue(new Error('No refresh token or refresh handler callback is set.')),
+    });
+    fakesHas(deps, false);
+    const spy = vi.fn();
+    withFetch(spy as unknown as typeof fetch);
+    const outcome = await processMeeting('m1', deps, () => 1751979219000);
+    expect(outcome).toEqual({ kind: 'completed' });
+    expect(spy).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it('retries a failed ID-token mint within the budget', async () => {
+    const fetchIdToken = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('metadata server unavailable'))
+      .mockResolvedValue('Bearer test-token');
+    const { deps } = makeDeps({
+      vm: { activatorUrl: ACT },
+      stopMaxWaitMs: 5_000,
+      stopPollIntervalMs: 10,
+      sleep: () => Promise.resolve(),
+      fetchIdToken,
+    });
+    fakesHas(deps, false);
+    const spy = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    withFetch(spy as unknown as typeof fetch);
+    const outcome = await processMeeting('m1', deps, () => 1751979219000);
+    expect(outcome).toEqual({ kind: 'completed' });
+    expect(fetchIdToken).toHaveBeenCalledTimes(2);
+    expect(spy).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
+  });
+
+  // 401 (bad token/audience) will not heal by retrying - one attempt, then
+  // give up instead of spinning the whole budget against a wall.
+  it('treats 401 as terminal: exactly one attempt, no retry', async () => {
+    const { deps } = makeDeps({
+      vm: { activatorUrl: ACT },
+      stopMaxWaitMs: 5_000,
+      stopPollIntervalMs: 10,
+      sleep: () => Promise.resolve(),
+    });
+    fakesHas(deps, false);
+    const spy = vi.fn().mockResolvedValue(new Response(null, { status: 401 }));
+    withFetch(spy as unknown as typeof fetch);
+    const outcome = await processMeeting('m1', deps, () => 1751979219000);
+    expect(outcome).toEqual({ kind: 'completed' });
+    expect(spy).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
+  });
+
+  it('treats other 4xx as terminal but keeps retrying 5xx', async () => {
+    const { deps } = makeDeps({
+      vm: { activatorUrl: ACT },
+      stopMaxWaitMs: 5_000,
+      stopPollIntervalMs: 10,
+      sleep: () => Promise.resolve(),
+    });
+    fakesHas(deps, false);
+    const spy = vi.fn().mockResolvedValue(new Response(null, { status: 404 }));
+    withFetch(spy as unknown as typeof fetch);
+    await processMeeting('m1', deps, () => 1751979219000);
+    expect(spy).toHaveBeenCalledTimes(1);
     vi.unstubAllGlobals();
   });
 });

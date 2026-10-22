@@ -21,6 +21,11 @@ export interface WorkerDeps {
   stopPollIntervalMs?: number;
   /** Injectable sleep so tests can skip real delays. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Injectable ID-token mint for /stop-jitsi (tests pass a stub). Must resolve
+   * to a full `Authorization` header value ("Bearer <token>") or reject.
+   */
+  fetchIdToken?: (audience: string) => Promise<string>;
 }
 
 /** Minutes of analytics silence that qualify the room as truly empty. */
@@ -53,6 +58,22 @@ function defaultSleep(ms: number): Promise<void> {
     const t = setTimeout(resolve, ms);
     t.unref?.();
   });
+}
+
+/**
+ * Mint a Google ID token for the activation backend. Uses IdTokenClient's
+ * getRequestHeaders() - NOT getAccessToken(), which lives on OAuth2Client,
+ * sees no refresh_token on a service-account token client, and always throws
+ * "No refresh token or refresh handler callback is set."
+ */
+async function defaultFetchIdToken(audience: string): Promise<string> {
+  const { GoogleAuth } = await import('google-auth-library');
+  const auth = new GoogleAuth();
+  const client = await auth.getIdTokenClient(audience);
+  const headers = await client.getRequestHeaders();
+  const authHeader = headers.get('Authorization');
+  if (!authHeader) throw new Error('ID-token client returned no Authorization header');
+  return authHeader;
 }
 
 export type Outcome =
@@ -105,7 +126,7 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
     throw err;
   }
 
-  if (!claimed) {
+  if (!claimed?.meeting_id) {
     logger.info({ meetingId }, 'worker: already processed or unknown; acking');
     await stopVmIfQuiet(meetingId, deps);
     return { kind: 'already-processed' };
@@ -170,7 +191,9 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
  *     stop proceeds. Previously this was a single one-shot check, so a ghost
  *     session permanently skipped the stop.
  *   - transient /stop-jitsi failures (network, 5xx from GCP stop) retry within
- *     the same budget.
+ *     the same budget; 4xx responses are terminal (retrying a rejected token
+ *     only spins the budget).
+ *   - fail-closed on auth: without a valid ID token no POST is ever sent.
  */
 export async function stopVmIfQuiet(meetingId: string, deps: WorkerDeps): Promise<void> {
   const activatorUrl = deps.vm?.activatorUrl?.replace(/\/$/, '');
@@ -216,32 +239,40 @@ export async function stopVmIfQuiet(meetingId: string, deps: WorkerDeps): Promis
   }
 
   // Phase 2: POST /stop-jitsi, retrying transient failures within the budget.
-  // Fetch a Google ID token for authentication.
-  let authHeaders: Record<string, string> = {};
-  try {
-    const { GoogleAuth } = await import('google-auth-library');
-    const auth = new GoogleAuth();
-    // Get ID token client for the activator URL audience
-    const client = await auth.getIdTokenClient(activatorUrl);
-    // getRequestHeaders returns a Headers object with Authorization
-    const headers = await client.getRequestHeaders();
-    const authHeader = headers.get('Authorization');
-    if (authHeader) {
-      authHeaders = { Authorization: authHeader };
-      logger.info({ meetingId }, 'vm: fetched ID token for /stop-jitsi');
-    }
-  } catch (err) {
-    logger.warn(
-      { meetingId, err: err instanceof Error ? err.message : String(err) },
-      'vm: failed to fetch ID token, proceeding without auth',
-    );
-  }
+  //
+  // Auth is mandatory. The backend rejects unauthenticated calls with 401, so
+  // a tokenless POST is a guaranteed failure that only burns the budget - and
+  // (paired with 401 redeliveries) a self-sustaining loop that kept both Cloud
+  // Run services warm for days in Oct 2026. The mint is retried inside the
+  // budget, but the POST is never sent without a token.
+  const fetchIdToken = deps.fetchIdToken ?? defaultFetchIdToken;
+  let authHeader: string | null = null;
 
   for (;;) {
+    if (!authHeader) {
+      try {
+        authHeader = await fetchIdToken(activatorUrl);
+        logger.info({ meetingId }, 'vm: fetched ID token for /stop-jitsi');
+      } catch (err) {
+        logger.warn(
+          { meetingId, err: err instanceof Error ? err.message : String(err) },
+          'vm: failed to fetch ID token for /stop-jitsi',
+        );
+      }
+      if (!authHeader) {
+        if (outOfBudget()) {
+          logger.error({ meetingId }, 'vm: no ID token within budget; skipping /stop-jitsi (never POST unauthenticated)');
+          return;
+        }
+        await sleep(Math.min(pollMs, remaining() || 1));
+        continue;
+      }
+    }
+
     try {
       const res = await fetch(`${activatorUrl}/stop-jitsi`, {
         method: 'POST',
-        headers: authHeaders,
+        headers: { Authorization: authHeader },
         signal: AbortSignal.timeout(15_000),
       });
       if (res.ok) {
@@ -249,6 +280,13 @@ export async function stopVmIfQuiet(meetingId: string, deps: WorkerDeps): Promis
         return;
       }
       logger.warn({ meetingId, status: res.status }, 'vm: /stop-jitsi returned non-ok status');
+      // 4xx means the request itself is wrong - a rejected token or bad URL
+      // will not heal by retrying, so stop immediately instead of spinning
+      // through the whole budget (408/429 are the transient exceptions).
+      if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+        logger.error({ meetingId, status: res.status }, 'vm: /stop-jitsi rejected the request; not retrying');
+        return;
+      }
     } catch (err) {
       logger.warn(
         { meetingId, err: err instanceof Error ? err.message : String(err) },

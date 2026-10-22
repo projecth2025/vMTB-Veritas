@@ -9,7 +9,10 @@ RUN npm run build
 FROM node:22-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
-COPY package.json ./
+# The lockfile must be present or `npm ci` falls back to `npm install`, which
+# ignores pinned versions and silently drifted the google-auth-library copy in
+# the runtime image.
+COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev || npm install --omit=dev
 COPY --from=build /app/dist ./dist
 EXPOSE 8080
