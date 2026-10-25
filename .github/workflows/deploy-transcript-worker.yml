@@ -123,16 +123,50 @@ jobs:
       # push subscription the first time, updates it afterwards. Auth is OIDC:
       # Pub/Sub signs calls as RUNTIME_SA, which must have run.invoker on this
       # service (granted in docs/DEPLOYMENT.md §2.3).
+      #
+      # Delivery safety: ack-deadline 300 covers the 3-minute live-session
+      # grace + retries inside one delivery (60s redelivered mid-flight), and a
+      # dead-letter topic with 5 attempts bounds runaway redelivery - an Oct
+      # 2026 reprocessing loop kept both Cloud Run services warm for days.
       - name: Wire Pub/Sub push subscription
         run: |
+          set -euo pipefail
           WORKER_URL=$(gcloud run services describe "$SERVICE" \
             --project "$PROJECT_ID" --region "$REGION" --format 'value(status.url)')
 
+          # Dead-letter topic must exist before it can be attached; its
+          # publisher IAM is what lets Pub/Sub move exhausted messages there.
+          gcloud pubsub topics create meeting-transcripts-dead-letter \
+            --project "$PROJECT_ID" || true
+          PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+          gcloud pubsub topics add-iam-policy-binding meeting-transcripts-dead-letter \
+            --project "$PROJECT_ID" \
+            --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com" \
+            --role="roles/pubsub.publisher" --quiet \
+            || echo "::warning::could not grant roles/pubsub.publisher to the Pub/Sub service agent on meeting-transcripts-dead-letter"
+
+          DLQ="projects/${PROJECT_ID}/topics/meeting-transcripts-dead-letter"
           gcloud pubsub subscriptions create meeting-transcripts-worker \
             --topic=meeting-transcripts \
+            --project "$PROJECT_ID" \
             --push-endpoint="${WORKER_URL}/pubsub/push" \
             --push-auth-service-account="${RUNTIME_SA}@${PROJECT_ID}.iam.gserviceaccount.com" \
-            --ack-deadline=60 \
+            --ack-deadline=300 \
+            --dead-letter-topic="$DLQ" \
+            --max-delivery-attempts=5 \
           || gcloud pubsub subscriptions update meeting-transcripts-worker \
+            --project "$PROJECT_ID" \
             --push-endpoint="${WORKER_URL}/pubsub/push" \
-            --push-auth-service-account="${RUNTIME_SA}@${PROJECT_ID}.iam.gserviceaccount.com"
+            --push-auth-service-account="${RUNTIME_SA}@${PROJECT_ID}.iam.gserviceaccount.com" \
+            --ack-deadline=300 \
+            --dead-letter-topic="$DLQ" \
+            --max-delivery-attempts=5
+
+          # Dead-lettering also needs the service agent to ack the original
+          # message on this subscription; without it nothing is forwarded and
+          # redelivery is still unbounded.
+          gcloud pubsub subscriptions add-iam-policy-binding meeting-transcripts-worker \
+            --project "$PROJECT_ID" \
+            --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com" \
+            --role="roles/pubsub.subscriber" --quiet \
+            || echo "::warning::could not grant roles/pubsub.subscriber to the Pub/Sub service agent on meeting-transcripts-worker"
