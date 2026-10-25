@@ -174,3 +174,80 @@ describe('resolveParticipantNames', () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+/** Minimal stand-in for the supabase-js `.rpc()` call. */
+function rpcClient(result: { data?: unknown; error?: { message: string } | null }) {
+  const calls: Array<{ fn: string; params: Record<string, unknown> }> = [];
+  const client = {
+    rpc(fn: string, params: Record<string, unknown>) {
+      calls.push({ fn, params });
+      return Promise.resolve({ data: result.data ?? null, error: result.error ?? null });
+    },
+  };
+  return { client: client as never, calls };
+}
+
+const claimedRow = {
+  meeting_id: 'm1',
+  status: 'PROCESSING',
+  transcript_object_key: null,
+  error_message: null,
+};
+
+// The live claim_meeting_transcript RPC (LANGUAGE sql, UPDATE ... RETURNING *)
+// answers "no PENDING row matched" as a composite with every column NULL -
+// not as JSON null. PostgREST hands that to JS as a truthy object, so the old
+// `if (!data)` guard let a COMPLETED meeting be reprocessed on every
+// redelivery (969 times in one day during the Oct 2026 loop).
+const allNullsRow = {
+  id: null,
+  meeting_id: null,
+  status: null,
+  transcript_object_key: null,
+  error_message: null,
+};
+
+describe('claim', () => {
+  it('returns the row when the claim wins', async () => {
+    const { client, calls } = rpcClient({ data: claimedRow });
+    const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
+
+    expect(await store.claim('m1')).toMatchObject({ meeting_id: 'm1', status: 'PROCESSING' });
+    expect(calls[0]).toMatchObject({ fn: 'claim_meeting_transcript', params: { p_meeting_id: 'm1' } });
+  });
+
+  it('returns null for the all-nulls row when no PENDING row matched', async () => {
+    const { client } = rpcClient({ data: allNullsRow });
+    const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
+
+    expect(await store.claim('m1')).toBeNull();
+  });
+
+  it('throws when the RPC errors', async () => {
+    const { client } = rpcClient({ error: { message: 'db down' } });
+    const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
+
+    await expect(store.claim('m1')).rejects.toThrow('claim_meeting_transcript: db down');
+  });
+});
+
+describe('complete', () => {
+  it('passes the artifact fields through', async () => {
+    const { client, calls } = rpcClient({ data: claimedRow });
+    const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
+
+    await store.complete('m1', 'meetings/m1/transcript/transcript-v1.json', 1, { summary: 'x' });
+
+    expect(calls[0]).toMatchObject({
+      fn: 'complete_meeting_transcript',
+      params: { p_meeting_id: 'm1', p_version: 1, p_mom: { summary: 'x' } },
+    });
+  });
+
+  it('throws when the RPC errors', async () => {
+    const { client } = rpcClient({ error: { message: 'db down' } });
+    const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
+
+    await expect(store.complete('m1', 'k', 1, null)).rejects.toThrow('complete_meeting_transcript: db down');
+  });
+});

@@ -44,8 +44,14 @@ export class SupabaseStore {
     const { data, error } = await this.client.rpc('claim_meeting_transcript', { p_meeting_id: meetingId });
     if (error) throw new Error(`claim_meeting_transcript: ${error.message}`);
     if (!data) return null;
-    const row = Array.isArray(data) ? data[0] : data;
-    return row as MeetingTranscriptRow;
+    const row = (Array.isArray(data) ? data[0] : data) as MeetingTranscriptRow | null;
+    // PostgREST serializes a "no row matched" result of a RETURNS <table>
+    // function as an object with every column null - which is truthy, so a
+    // plain `if (!data)` check treats an *unclaimed* meeting as claimed and
+    // reprocesses it (LLM + GCS + /stop-jitsi) on every redelivery. Only a
+    // row carrying our meeting_id actually won the claim.
+    if (!row || row.meeting_id == null) return null;
+    return row;
   }
 
   async fetchSegments(meetingId: string): Promise<SegmentRow[]> {
@@ -59,13 +65,20 @@ export class SupabaseStore {
   }
 
   async complete(meetingId: string, objectKey: string, version: number, mom: unknown): Promise<void> {
-    const { error } = await this.client.rpc('complete_meeting_transcript', {
+    const { data, error } = await this.client.rpc('complete_meeting_transcript', {
       p_meeting_id: meetingId,
       p_object_key: objectKey,
       p_version: version,
       p_mom: mom ?? null,
     });
     if (error) throw new Error(`complete_meeting_transcript: ${error.message}`);
+    // Same all-nulls serialization as claim(): a truthy data object does not
+    // mean the status transition happened. Row stuck non-PROCESSING means the
+    // artifacts are uploaded but the DB row disagrees - surface it loudly.
+    const row = (Array.isArray(data) ? data[0] : data) as { meeting_id?: string | null } | null;
+    if (!row || row.meeting_id == null) {
+      logger.warn({ meetingId }, 'store: complete_meeting_transcript matched no PROCESSING row');
+    }
   }
 
   async fail(meetingId: string, errorMessage: string): Promise<void> {

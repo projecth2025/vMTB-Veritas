@@ -311,12 +311,26 @@ gcloud storage buckets create gs://vmtb-transcripts \
   --location=asia-southeast1 --uniform-bucket-level-access
 
 # Pub/Sub topic + a push subscription (fill in the real worker URL once deployed)
+# ack-deadline 300: one delivery re-checks live-session heartbeats for up to
+# ~4 min (60s redelivered mid-flight). The DLQ + 5 attempts bound runaway
+# redelivery — see "Resolved incidents" in docs/LEGACY_AND_KNOWN_ISSUES.md.
 gcloud pubsub topics create meeting-transcripts
+gcloud pubsub topics create meeting-transcripts-dead-letter
+gcloud pubsub topics add-iam-policy-binding meeting-transcripts-dead-letter \
+  --member="serviceAccount:service-$(gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)')@gcp-sa-pubsub.iam.gserviceaccount.com" \
+  --role="roles/pubsub.publisher"
 gcloud pubsub subscriptions create meeting-transcripts-worker \
   --topic=meeting-transcripts \
   --push-endpoint=REPLACE_WITH_WORKER_URL_AFTER_DEPLOY \
   --push-auth-service-account=YOUR_PROJECT_NUMBER-compute@developer.gserviceaccount.com \
-  --ack-deadline=60
+  --ack-deadline=300 \
+  --dead-letter-topic=projects/YOUR_PROJECT_ID/topics/meeting-transcripts-dead-letter \
+  --max-delivery-attempts=5
+# Dead-lettering also needs the service agent to ack on the subscription,
+# otherwise nothing is forwarded and redelivery stays unbounded.
+gcloud pubsub subscriptions add-iam-policy-binding meeting-transcripts-worker \
+  --member="serviceAccount:service-$(gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)')@gcp-sa-pubsub.iam.gserviceaccount.com" \
+  --role="roles/pubsub.subscriber"
 ```
 
 Build + deploy each service directly (equivalent to what the GitHub Actions
@@ -938,8 +952,13 @@ gcloud run services describe stt-service --project YOUR_PROJECT_ID \
   closed the tab without a clean leave (ghost `status='active'` row) ages out
   instead of permanently skipping the stop, and it **retries** transient
   `/stop-jitsi` failures (the activator returns 5xx when the GCP stop fails).
-  Requires the loader's Supabase analytics to be running — it is,
-  automatically. Watch for `vm: /stop-jitsi fired successfully` in worker logs.
+  Auth is **fail-closed**: no Google ID token → no POST (never "proceed
+  without auth"), and a 4xx answer is terminal rather than retried through
+  the whole budget. Requires the loader's Supabase analytics to be running —
+  it is, automatically. Watch for `vm: /stop-jitsi fired successfully` in
+  worker logs. Delivery safety (`ack-deadline=300`, dead-letter topic,
+  5 attempts) is wired by the worker deploy workflow — §2.2 for the manual
+  equivalent.
 - ⚠️ Frequent VM stop/start cycles change its ephemeral external IP. While
   your meeting URL is an sslip.io hostname that IP is baked into the name —
   either reserve a static IP (~₹10/day, billed whenever attached *or* idle)
