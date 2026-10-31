@@ -945,34 +945,49 @@ gcloud run services describe stt-service --project YOUR_PROJECT_ID \
 - Orphan protection: the STT service closes WebSocket sessions after
   `STT_IDLE_TIMEOUT_SECONDS` (default 300s) of silence, so a crashed client
   cannot hold the GPU for the full request timeout.
-- The Jitsi VM **stops itself now**: the transcript-worker fires
-  `POST $ACT_URL/stop-jitsi` after every processed meeting. Within the same
-  push delivery (Cloud Run timeout **600s**) it **re-checks** the live-session
-  guard for up to `VM_STOP_MAX_WAIT_MS` (default 4 min) so a participant who
-  closed the tab without a clean leave (ghost `status='active'` row) ages out
-  instead of permanently skipping the stop, and it **retries** transient
-  `/stop-jitsi` failures (the activator returns 5xx when the GCP stop fails).
-  Auth is **fail-closed**: no Google ID token → no POST (never "proceed
-  without auth"), and a 4xx answer is terminal rather than retried through
-  the whole budget. Requires the loader's Supabase analytics to be running —
-  it is, automatically. Watch for `vm: /stop-jitsi fired successfully` in
-  worker logs. Delivery safety (`ack-deadline=300`, dead-letter topic,
-  5 attempts) is wired by the worker deploy workflow — §2.2 for the manual
-  equivalent.
+- The Jitsi VM **stops itself now**, on two independent paths:
+  - *Fast path:* the transcript-worker fires `POST $ACT_URL/stop-jitsi`
+    after every processed meeting. Within the same push delivery (Cloud Run
+    timeout **600s**) it **re-checks** the live-session guard for up to
+    `VM_STOP_MAX_WAIT_MS` (default 4 min) so a participant who closed the tab
+    without a clean leave (ghost `status='active'` row) ages out instead of
+    permanently skipping the stop, and it **retries** transient
+    `/stop-jitsi` failures (the activator returns 5xx when the GCP stop
+    fails). Auth is **fail-closed**: no Google ID token → no POST (never
+    "proceed without auth"), and a 4xx answer is terminal rather than
+    retried through the whole budget. Requires the loader's Supabase
+    analytics to be running — it is, automatically. Watch for
+    `vm: /stop-jitsi fired successfully` in worker logs. Delivery safety
+    (`ack-deadline=300`, dead-letter topic, 5 attempts) is wired by the
+    worker deploy workflow — §2.2 for the manual equivalent.
+  - *Backstop:* `POST $ACT_URL/reap-idle`, invoked by Cloud Scheduler every
+    30 min, catches every boot that never produced a `meeting.completed`
+    event (abandoned waiting room, lost delivery, worker outage) — the leak
+    that used to leave the VM on, idle, for days. It stops the VM only when
+    ALL guards pass: running past a 10-min boot grace, no `/start-jitsi`
+    poll within 10 min (`jitsi_vm_activity` ledger), and no meeting-session
+    heartbeat within 3 min; any unreadable signal means skip, never stop.
+    One-time job (enable Cloud Scheduler API if prompted):
+    ```bash
+    gcloud scheduler jobs create http vmtb-reap-idle \
+      --location=asia-south1 \
+      --schedule="*/30 * * * *" \
+      --uri="$ACT_URL/reap-idle" --http-method=POST \
+      --oidc-service-account-email=vmtb-services@vmtb-new.iam.gserviceaccount.com \
+      --oidc-token-audience="$ACT_URL/reap-idle"
+    ```
+    Requires migration `main/supabase/migrations/20261031_jitsi_vm_activity.sql`
+    in Supabase first; until then every tick skips (fail-safe) and logs why.
 - ⚠️ Frequent VM stop/start cycles change its ephemeral external IP. While
   your meeting URL is an sslip.io hostname that IP is baked into the name —
   either reserve a static IP (~₹10/day, billed whenever attached *or* idle)
-  or move to `meet.vmtb.in` (§6.7). Safety net if you skip this:
+  or move to `meet.vmtb.in` (§6.7). ~~Safety net if you skip this~~ **the
+  idle reaper above now supersedes this**; the old nightly job below stops
+  the VM *unconditionally*, which can kill a meeting running after 18:30 —
+  delete it if present:
   ```bash
-  gcloud scheduler jobs create http vmtb-nightly-stop \
-    --location=asia-south1 \
-    --schedule="30 18 * * *" --time-zone="Asia/Kolkata" \
-    --uri="$ACT_URL/stop-jitsi" --http-method=POST \
-    --oidc-service-account-email=vmtb-services@vmtb-new.iam.gserviceaccount.com \
-    --oidc-token-audience="$ACT_URL"
+  gcloud scheduler jobs delete vmtb-nightly-stop --location=asia-south1
   ```
-  (`/stop-jitsi` only accepts a `vmtb-services` ID token for that audience.)
-  (enable Cloud Scheduler API if prompted)
 - Render static sites and Vercel hobby projects are free at this scale.
 - Cost audit after any test session: Console → Cloud Run → stt-service →
   **Metrics** → `Billable instance time`. A 2-minute meeting should show

@@ -42,21 +42,66 @@ fail-closed: without a mintable ID token the worker skips the POST entirely,
 and a 401/4xx answer is treated as terminal (one attempt, no retry) so a
 misconfiguration can never turn into a request loop.
 
-**Auth.** All three endpoints return 401 without a valid caller (`/` stays
-open for health checks):
+**Idle reaper (`POST /reap-idle`).** The worker's stop is *edge-triggered*:
+it only fires after a `meeting.completed` event. Any VM boot without that
+event — an abandoned waiting room, a lost Pub/Sub delivery, a worker outage —
+used to leak the VM, on and billing, until someone stopped it by hand. The
+reaper is the level-triggered backstop: a Cloud Scheduler job calls it every
+30 minutes, and it stops the VM only when **every** guard says nobody needs
+it (cheap checks first):
+
+1. VM not `RUNNING` → nothing to do;
+2. **boot grace** — booted less than `VM_IDLE_MINUTES` ago (default 10) →
+   skip, protecting a user still sitting in the waiting room;
+3. **recent waiting-room poll** — `/start-jitsi` stamped
+   `jitsi_vm_activity.last_start_poll_at` within `VM_IDLE_MINUTES` → skip;
+4. **live meeting** — a `meeting_sessions` heartbeat within
+   `VM_HEARTBEAT_GRACE_MINUTES` (default 3, same predicate the worker uses)
+   → skip.
+
+Only when all four pass does it call GCP stop. Every *unreadable* signal
+(Supabase down, GCP read failure) means "unknown", and unknown **never**
+stops the VM — fail-safe is skip, not stop. Worst-case idle after the last
+sign of life is `VM_IDLE_MINUTES` + the 30-minute tick. One-time setup:
+
+```bash
+gcloud scheduler jobs create http vmtb-reap-idle \
+  --location=asia-south1 \
+  --schedule="*/30 * * * *" \
+  --uri="https://<ACT_URL>/reap-idle" --http-method=POST \
+  --oidc-service-account-email=vmtb-services@vmtb-new.iam.gserviceaccount.com \
+  --oidc-token-audience="https://<ACT_URL>/reap-idle"
+```
+
+The audience must equal the backend's `REAPER_AUDIENCE` (default:
+`JITSI_ACTIVATOR_URL` + `/reap-idle`), which is deliberately different from
+the worker's audience, so a worker/proxy token cannot drive the reaper and
+vice versa. Requires the `jitsi_vm_activity` Supabase table (migration
+`20261031_jitsi_vm_activity.sql`); until it exists the reaper skips every
+tick (fail-safe) and logs why. Self-check: `python
+jitsi-activation-backend/check_reap.py`.
+
+**Auth.** All endpoints return 401 without a valid caller (`/` stays open
+for health checks):
 
 - `/start-jitsi` and `/status` take the meeting **join ticket** in an
   `X-Join-Ticket` header (jitsi-frontend sends it); the backend looks it up
   in `meeting_join_tickets` and rejects expired ones.
-- `/stop-jitsi` takes **only** a Google ID token (`Authorization: Bearer`)
-  minted by transcript-worker for audience `JITSI_ACTIVATOR_URL`. A join
-  ticket is refused there, or any participant could end everyone's meeting.
+- `/stop-jitsi` and `/reap-idle` take **only** a Google ID token
+  (`Authorization: Bearer`), and a join ticket is refused on both, or any
+  participant could end everyone's meeting. The worker mints for audience
+  `JITSI_ACTIVATOR_URL`; Cloud Scheduler mints for `REAPER_AUDIENCE`
+  (default `JITSI_ACTIVATOR_URL` + `/reap-idle`).
 
 Backend config, set on the Cloud Run service: `SUPABASE_URL`,
 `SUPABASE_SERVICE_ROLE_KEY` (secret ref `supabase-service-role-key`),
 `WORKER_SERVICE_ACCOUNT` (`vmtb-services@vmtb-new.iam.gserviceaccount.com`,
 the SA transcript-worker runs as) and `JITSI_ACTIVATOR_URL` (the backend's
-own run.app URL, same value as on the worker). The deploy workflow now sets
+own run.app URL, same value as on the worker). The reaper adds optional
+overrides — `REAPER_SERVICE_ACCOUNT` (defaults to `WORKER_SERVICE_ACCOUNT`),
+`REAPER_AUDIENCE`, `VM_IDLE_MINUTES` (10), `VM_HEARTBEAT_GRACE_MINUTES` (3),
+`POLL_ACTIVITY_WRITE_INTERVAL_SECONDS` (60) — all defaulted in code, so no
+workflow change is required. The deploy workflow now sets
 both auth vars on **every** deploy (`WORKER_SERVICE_ACCOUNT` via the deploy
 step, `JITSI_ACTIVATOR_URL` via a follow-up update from the service's own
 URL), so a manual `gcloud run services update` needs them only on a brand-new
@@ -227,7 +272,9 @@ and the Pub/Sub pipeline are all hostname-agnostic for the VM.
 
 Shut down when done: `gcloud compute instances stop jitsi-vm --zone=asia-south1-c`
 (or let the worker's automatic `/stop-jitsi` do it — it retries within ~4 min
-of meeting completion so ghost analytics sessions don't leave the VM billing).
+of meeting completion so ghost analytics sessions don't leave the VM billing;
+and if both are missed, the idle reaper stops the VM within ~40 min of the
+last sign of life).
 
 Next session:
 
