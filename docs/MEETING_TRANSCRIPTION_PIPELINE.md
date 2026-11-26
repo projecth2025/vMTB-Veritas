@@ -82,8 +82,9 @@ Reconciliation is now implemented as a lazy join-on-time-window, in the
    `meeting.completed {meeting_id, mtb_id:null}` to Pub/Sub.
 
 5. **Post-processing.** `transcript-worker` (triggered by the Pub/Sub push
-   subscription) atomically claims the meeting (`PENDING → PROCESSING`), reads
-   the ordered segments, uploads `transcript-v1.json`/`.txt` to
+   subscription) atomically claims the meeting (`PENDING → PROCESSING`, or
+   reclaims a `PROCESSING` row whose lease expired — see *Status machine*),
+   reads the ordered segments, uploads `transcript-v1.json`/`.txt` to
    `gs://<bucket>/meetings/<meeting_id>/transcript/`, optionally generates MoM
    via LLM, then marks `COMPLETED` with the object key and MoM. Failures are
    recorded as `FAILED` and acked; only infra failures nack for redelivery.
@@ -93,17 +94,44 @@ Reconciliation is now implemented as a lazy join-on-time-window, in the
 ```
                 proxy (ensure)         worker (claim)        worker
    (none) ──▶ PENDING ────────────▶ PROCESSING ──────────▶ COMPLETED
-                                        │                     
-                                        └─(error)──▶ FAILED
+                                        │  ▲
+                                        │  └── lease expired: reclaim (attempts+1)
+                                        └─(error / attempts exhausted)──▶ FAILED
 ```
 
 - `ensure_meeting_transcript` — idempotent insert (proxy)
-- `claim_meeting_transcript` — atomic PENDING→PROCESSING lock (worker)
+- `claim_meeting_transcript` — atomic PENDING→PROCESSING lock, **or**
+  PROCESSING with an **expired lease** (worker)
 - `complete_meeting_transcript` — PROCESSING→COMPLETED (worker)
 - `fail_meeting_transcript` — PROCESSING→FAILED (worker)
 
 All transitions are single-source-of-truth RPCs, so the proxy and worker can
 never disagree about a meeting's state.
+
+**Lease and attempts** (`main/supabase/migrations/20261125_meeting_transcript_lease.sql`):
+
+A worker can die between claim and complete/fail — Cloud Run instance
+replacement, a request timeout, OOM, or a deploy landing mid-request. Before
+the lease, `claim` only accepted `PENDING`, so that row stayed `PROCESSING`
+forever: every Pub/Sub redelivery got "no row" back, was **acked** as
+"already processed", and the minutes were never produced.
+
+- `claim_meeting_transcript` now also accepts a `PROCESSING` row whose
+  `claimed_at` is older than the lease (600 s — above the worker's 600 s
+  Cloud Run request timeout). Each claim stamps a fresh `claimed_at`, bumps
+  `attempts`, and returns the row as a **claim token**.
+- `complete_meeting_transcript` / `fail_meeting_transcript` take that token
+  (`p_claimed_at`) and only act when it still matches, so a worker presumed
+  dead cannot overwrite a newer attempt's result.
+- After `meeting_transcript_max_attempts()` (3) claims, `claim` marks the row
+  `FAILED` with a clear message instead of retrying forever.
+
+So the row always ends `COMPLETED` or `FAILED` — never stuck in `PROCESSING`.
+The worker treats a claim that returns nothing as "terminal or live-claimed
+elsewhere" and acks.
+
+Scenario tests: `main/supabase/tests/meeting_transcript_lease_test.sql`
+(run instructions in its header; rolls back, leaves no trace).
 
 **`get_mtb_transcripts(p_mtb_id UUID)`** (`SECURITY DEFINER`, read side,
 `main/supabase/migrations/20260924_get_mtb_transcripts_session_link.sql`) —
@@ -185,12 +213,18 @@ this RPC — if it's the one actually live — remains in effect.
 | `LLM_API_KEY` | — | Only for non-vertex providers (Vertex uses ADC / `roles/aiplatform.user`) |
 | `LLM_MODEL` | *(from provider)* | Vertex: `google/gemini-3.1-flash-lite` (cheapest stable Flash-Lite; `google/` prefix required on Vertex) |
 | `VERTEX_LOCATION` | `global` | Vertex location in the base URL (global endpoint = same list price as regional) |
-| `JITSI_ACTIVATOR_URL` | `""` (disabled) | After completing a meeting, POSTs `{url}/stop-jitsi` so the VM isn't left billing — see `docs/JITSI_VM_OPERATIONS.md` |
+| `JITSI_ACTIVATOR_URL` | `""` (disabled) | After completing a meeting, POSTs `{url}/stop-jitsi` so the VM isn't left billing — see `docs/JITSI_VM_OPERATIONS.md`. The backend applies its own idle guards unless `force=true` is passed, so the worker's stop goes through the same decision as the reaper |
 | `VM_STOP_MAX_WAIT_MS` | `240000` | Within one push delivery, how long the worker re-checks live-session heartbeats and retries `/stop-jitsi` (must stay under the Cloud Run request timeout, **600s**) |
 | `VM_STOP_POLL_INTERVAL_MS` | `15000` | Delay between live-session rechecks / stop retries |
 
 ## Trade-offs and notes
 
+- **One guarded stop decision.** The worker's `stopVmIfQuiet` and the scheduled
+  `/reap-idle` both end at `POST /stop-jitsi`, which runs the same five guards
+  (`evaluate_stop_guards` in `jitsi-activation-backend/main.py`) the reaper
+  does. Every automatic stop therefore sees the same signals — waiting-room
+  polls, heartbeats and VM traffic — instead of each stopper keeping its own
+  view. A caller that genuinely means it passes `force=true`.
 - **Only FINAL segments are stored** in Supabase — clean, non-duplicated
   utterance records; interim results live only in proxy memory.
 - **Artifacts are generated post-meeting**, not during it, keeping the

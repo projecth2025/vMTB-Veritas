@@ -40,7 +40,14 @@ const bothVerified = new Map<string, SpeakerIdentity | null>([
 
 function makeDeps(overrides: Partial<WorkerDeps> = {}): { deps: WorkerDeps; fakes: Record<string, ReturnType<typeof vi.fn>> } {
   const fakes = {
-    claim: vi.fn().mockResolvedValue({ meeting_id: 'm1', status: 'PENDING', transcript_object_key: null, error_message: null }),
+    claim: vi.fn().mockResolvedValue({
+      meeting_id: 'm1',
+      status: 'PENDING',
+      transcript_object_key: null,
+      error_message: null,
+      claimed_at: '2026-11-25T00:00:00Z',
+      attempts: 1,
+    }),
     fetchSegments: vi.fn().mockResolvedValue(segments),
     resolveParticipantNames: vi.fn().mockResolvedValue(new Map<string, SpeakerIdentity | null>()),
     hasActiveSession: vi.fn().mockResolvedValue(false),
@@ -93,7 +100,7 @@ describe('processMeeting', () => {
       '[Speaker 1 - unverified] hello world\n\n[Speaker 2 - unverified] second speaker',
       'text/plain',
     );
-    expect(fakes.complete).toHaveBeenCalledWith('m1', 'meetings/m1/transcript/transcript-v1.json', 1, null);
+    expect(fakes.complete).toHaveBeenCalledWith('m1', 'meetings/m1/transcript/transcript-v1.json', 1, null, '2026-11-25T00:00:00Z');
     expect(fakes.fail).not.toHaveBeenCalled();
   });
 
@@ -131,8 +138,33 @@ describe('processMeeting', () => {
     fakes.upload.mockRejectedValue(new Error('storage quota exceeded'));
     const outcome = await processMeeting('m1', deps);
     expect(outcome).toEqual({ kind: 'failed', error: 'storage quota exceeded' });
-    expect(fakes.fail).toHaveBeenCalledWith('m1', 'storage quota exceeded');
+    expect(fakes.fail).toHaveBeenCalledWith('m1', 'storage quota exceeded', '2026-11-25T00:00:00Z');
     expect(fakes.complete).not.toHaveBeenCalled();
+  });
+
+  // The lease lives in SQL; here we pin the worker half of it: a row that was
+  // reclaimed after its lease expired comes back with a fresh claim token, and
+  // that token is what reaches complete/fail so an older attempt cannot win.
+  it('passes the reclaim claim token to complete (worker died mid-job, lease expired)', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.claim.mockResolvedValue({
+      meeting_id: 'm1',
+      status: 'PROCESSING',
+      transcript_object_key: null,
+      error_message: null,
+      claimed_at: '2026-11-25T00:10:00Z',
+      attempts: 2,
+    });
+    const outcome = await processMeeting('m1', deps);
+
+    expect(outcome).toEqual({ kind: 'completed' });
+    expect(fakes.complete).toHaveBeenCalledWith(
+      'm1',
+      'meetings/m1/transcript/transcript-v1.json',
+      1,
+      null,
+      '2026-11-25T00:10:00Z',
+    );
   });
 
   it('marks FAILED and acks when the LLM step fails', async () => {

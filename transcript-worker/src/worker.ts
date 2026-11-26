@@ -109,12 +109,15 @@ export interface TranscriptArtifact {
 
 /**
  * One meeting.completed job:
- *   claim (idempotent) -> read segments -> upload artifacts to GCS ->
- *   generate MoM -> mark COMPLETED.
+ *   claim (idempotent, with lease) -> read segments -> upload artifacts to GCS
+ *   -> generate MoM -> mark COMPLETED.
  *
  * Any processing error marks the row FAILED and is *acked* (HTTP 200): retrying
  * the same immutable meeting won't fix it, so we record the failure instead.
  * Only infra failures during the claim itself are left to Pub/Sub redelivery.
+ *
+ * A claim that returns nothing means the row is terminal (COMPLETED/FAILED) or
+ * is live-claimed elsewhere; either way there is nothing to do, so we ack.
  */
 export async function processMeeting(meetingId: string, deps: WorkerDeps, now = Date.now): Promise<Outcome> {
   let claimed;
@@ -131,6 +134,8 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
     await stopVmIfQuiet(meetingId, deps);
     return { kind: 'already-processed' };
   }
+
+  const claimToken = claimed.claimed_at ?? null;
 
   try {
     // Let straggler segment inserts land before the single fetch below.
@@ -164,14 +169,14 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
 
     const mom = await generateMom(segments, deps.llm, undefined, labels);
 
-    await deps.supabase.complete(meetingId, objectKey, TRANSCRIPT_VERSION, mom);
+    await deps.supabase.complete(meetingId, objectKey, TRANSCRIPT_VERSION, mom, claimToken);
     logger.info({ meetingId, segments: segments.length, mom: Boolean(mom) }, 'worker: meeting completed');
     await stopVmIfQuiet(meetingId, deps);
     return { kind: 'completed' };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     logger.error({ meetingId, err: error }, 'worker: processing failed, marking FAILED');
-    await deps.supabase.fail(meetingId, error);
+    await deps.supabase.fail(meetingId, error, claimToken);
     await stopVmIfQuiet(meetingId, deps);
     return { kind: 'failed', error };
   }

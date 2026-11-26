@@ -6,6 +6,9 @@ export interface MeetingTranscriptRow {
   status: string;
   transcript_object_key: string | null;
   error_message: string | null;
+  /** Claim token for this PROCESSING attempt; must be passed back to complete/fail. */
+  claimed_at: string | null;
+  attempts: number | null;
 }
 
 export interface SegmentRow {
@@ -39,7 +42,11 @@ export class SupabaseStore {
     this.client = client ?? createClient(url, serviceRoleKey, { auth: { persistSession: false } });
   }
 
-  /** Atomically claim a PENDING meeting. Returns null when no PENDING row exists. */
+  /**
+   * Atomically claim a PENDING meeting, or a PROCESSING one whose lease
+   * expired (the worker died mid-job). Returns null for a terminal row or a
+   * live lease held elsewhere. The returned `claimed_at` is the claim token.
+   */
   async claim(meetingId: string): Promise<MeetingTranscriptRow | null> {
     const { data, error } = await this.client.rpc('claim_meeting_transcript', { p_meeting_id: meetingId });
     if (error) throw new Error(`claim_meeting_transcript: ${error.message}`);
@@ -64,12 +71,19 @@ export class SupabaseStore {
     return (data ?? []) as SegmentRow[];
   }
 
-  async complete(meetingId: string, objectKey: string, version: number, mom: unknown): Promise<void> {
+  async complete(
+    meetingId: string,
+    objectKey: string,
+    version: number,
+    mom: unknown,
+    claimedAt: string | null,
+  ): Promise<void> {
     const { data, error } = await this.client.rpc('complete_meeting_transcript', {
       p_meeting_id: meetingId,
       p_object_key: objectKey,
       p_version: version,
       p_mom: mom ?? null,
+      p_claimed_at: claimedAt,
     });
     if (error) throw new Error(`complete_meeting_transcript: ${error.message}`);
     // Same all-nulls serialization as claim(): a truthy data object does not
@@ -81,10 +95,11 @@ export class SupabaseStore {
     }
   }
 
-  async fail(meetingId: string, errorMessage: string): Promise<void> {
+  async fail(meetingId: string, errorMessage: string, claimedAt: string | null): Promise<void> {
     const { error } = await this.client.rpc('fail_meeting_transcript', {
       p_meeting_id: meetingId,
       p_error_message: errorMessage.slice(0, 2000),
+      p_claimed_at: claimedAt,
     });
     if (error) {
       logger.warn({ err: error.message, meetingId }, 'store: fail_meeting_transcript failed');
