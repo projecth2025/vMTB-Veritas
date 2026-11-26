@@ -23,6 +23,25 @@ export interface SelfHostedOptions {
 //   server -> client: { "message": "partial", "transcript": "..." }
 //                     { "message": "final",   "transcript": "..." }
 //   Server closes the socket at end of stream.
+
+/**
+ * The real states of the STT socket. `reconnecting -> gave_up` is the retry
+ * path; everything else walks connecting -> streaming -> draining -> closed.
+ * Illegal jumps are refused by `transition()` so combinations like
+ * "closed but still reconnecting" cannot be represented.
+ */
+type SttState = 'idle' | 'connecting' | 'streaming' | 'draining' | 'reconnecting' | 'gave_up' | 'closed';
+
+const STT_TRANSITIONS: Record<SttState, SttState[]> = {
+  idle: ['connecting', 'closed'],
+  connecting: ['streaming', 'reconnecting', 'draining', 'gave_up', 'closed'],
+  streaming: ['draining', 'reconnecting', 'closed', 'connecting'],
+  draining: ['closed', 'connecting'],
+  reconnecting: ['streaming', 'draining', 'gave_up', 'closed', 'connecting'],
+  gave_up: ['closed', 'connecting'],
+  closed: ['connecting'],
+};
+
 export class SelfHostedSTTProvider implements STTProvider {
   onResult?: (result: SttResult) => void;
   onError?: (err: Error) => void;
@@ -32,8 +51,7 @@ export class SelfHostedSTTProvider implements STTProvider {
   private ws: WebSocket | null = null;
   private maxRetries: number;
   private retryDelayMs: number;
-  private closed = false;
-  private draining = false;
+  private state: SttState = 'idle';
   private retryAttempt = 0;
 
   constructor(private options: SelfHostedOptions) {
@@ -45,8 +63,26 @@ export class SelfHostedSTTProvider implements STTProvider {
     this.retryDelayMs = options.retryDelayMs ?? 2000;
   }
 
+  /** Current connection state (read-only; for diagnostics and tests). */
+  get sttState(): SttState {
+    return this.state;
+  }
+
+  /** Move to `to`, or refuse an illegal jump (logged, returns false). */
+  private transition(to: SttState): boolean {
+    if (this.state === to) return true;
+    if (!STT_TRANSITIONS[this.state].includes(to)) {
+      logger.warn({ from: this.state, to }, 'stt: illegal state transition ignored');
+      return false;
+    }
+    this.state = to;
+    return true;
+  }
+
   connect(): Promise<void> {
-    this.closed = false;
+    // A fresh connect is a fresh attempt: no leftover retry budget or drain.
+    this.retryAttempt = 0;
+    this.transition('connecting');
     return this.openSocket();
   }
 
@@ -63,8 +99,11 @@ export class SelfHostedSTTProvider implements STTProvider {
         ws.removeEventListener('error', onOpenError);
         this.retryAttempt = 0;
         // Fires on the first open AND every background reconnect so the
-        // proxy can flip started=true and flush its pre-start media queue.
-        if (!this.closed && !this.draining) this.onOpen?.();
+        // proxy can flip to streaming and flush its pre-start media queue.
+        if (this.state !== 'closed' && this.state !== 'draining') {
+          this.transition('streaming');
+          this.onOpen?.();
+        }
         resolve();
       };
 
@@ -92,7 +131,7 @@ export class SelfHostedSTTProvider implements STTProvider {
             });
           } else if (parsed.message === 'end_of_stream_done') {
             // Backend flushed its tail and is about to close; stop reconnecting.
-            this.draining = true;
+            this.transition('draining');
             this.onEndOfStreamDone?.();
           } else if (parsed.message === 'ready_to_stop' || parsed.message === 'info') {
             logger.debug({ message: parsed.message }, 'stt: control message');
@@ -103,13 +142,14 @@ export class SelfHostedSTTProvider implements STTProvider {
       });
 
       ws.addEventListener('close', () => {
-        if (this.closed) return;
-        if (this.draining) {
+        if (this.state === 'closed') return;
+        if (this.state === 'draining') {
           // Backend closed after end-of-stream ack (or mid-drain); either way
           // the drain is over — never reconnect once we are tearing down.
           this.onEndOfStreamDone?.();
           return;
         }
+        if (this.state === 'gave_up') return;
         logger.warn('stt: connection closed unexpectedly, scheduling reconnect');
         this.scheduleReconnect();
       });
@@ -174,23 +214,24 @@ export class SelfHostedSTTProvider implements STTProvider {
   }
 
   sendEndOfStream(): void {
-    if (this.closed || this.draining) return;
+    if (this.state === 'closed' || this.state === 'draining') return;
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       // Nothing to flush against; surface completion so the caller never waits.
       this.onEndOfStreamDone?.();
       return;
     }
-    this.draining = true;
+    this.transition('draining');
     this.ws.send(JSON.stringify({ message: 'end_of_stream' }));
   }
 
   private scheduleReconnect(): void {
-    if (this.closed || this.retryAttempt >= this.maxRetries) {
-      if (!this.closed) {
-        this.handleError(new Error('stt: max reconnect attempts exceeded'));
-      }
+    if (this.state === 'closed' || this.state === 'gave_up') return;
+    if (this.retryAttempt >= this.maxRetries) {
+      this.transition('gave_up');
+      this.handleError(new Error('stt: max reconnect attempts exceeded'));
       return;
     }
+    this.transition('reconnecting');
     this.retryAttempt++;
     const delay = this.retryDelayMs * 2 ** (this.retryAttempt - 1);
     logger.info({ attempt: this.retryAttempt, delayMs: delay }, 'stt: reconnecting');
@@ -206,7 +247,7 @@ export class SelfHostedSTTProvider implements STTProvider {
   }
 
   close(): Promise<void> {
-    this.closed = true;
+    this.transition('closed');
     return new Promise((resolve) => {
       if (!this.ws) {
         resolve();

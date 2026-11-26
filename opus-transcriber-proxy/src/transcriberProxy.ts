@@ -256,17 +256,30 @@ interface OutgoingConnectionOptions {
   onClosed: (tag: string) => void;
 }
 
-class OutgoingConnection {
+/**
+ * The real states of one participant's outgoing connection. Illegal jumps
+ * (streaming -> buffering, closed -> anything but a fresh connect, ...) are
+ * refused by `transition()` instead of being silently tolerated by a tangle
+ * of independent booleans.
+ */
+type OutgoingState = 'buffering' | 'streaming' | 'draining' | 'closed';
+
+const OUTGOING_TRANSITIONS: Record<OutgoingState, OutgoingState[]> = {
+  buffering: ['streaming', 'draining', 'closed'],
+  streaming: ['draining', 'closed'],
+  draining: ['closed'],
+  closed: [],
+};
+
+export class OutgoingConnection {
   private readonly options: OutgoingConnectionOptions;
   private readonly decoder: OpusToPcm16;
   private pcmAccumulator: Int16Array = new Int16Array(0);
   private utteranceStartSec: number;
-  private started = false;
+  private state: OutgoingState = 'buffering';
   private pendingMedia: Buffer[] = [];
   /** In-flight decodeAndBuffer() promises, awaited before drain. */
   private readonly inFlightDecodes = new Set<Promise<void>>();
-  private draining = false;
-  private closed = false;
 
   constructor(options: OutgoingConnectionOptions) {
     this.options = options;
@@ -278,8 +291,27 @@ class OutgoingConnection {
     // Fires on the first connect AND each successful background reconnect
     // (e.g. after a cold-start 429). The connect() promise only settles for
     // the first attempt, so without this the connection would buffer media
-    // forever with started=false.
+    // forever before ever reaching 'streaming'.
     options.stt.onOpen = () => this.handleSttOpen();
+  }
+
+  /** Move to `to`, or refuse an illegal jump (logged, returns false). */
+  private transition(to: OutgoingState): boolean {
+    if (this.state === to) return true;
+    if (!OUTGOING_TRANSITIONS[this.state].includes(to)) {
+      logger.warn(
+        { sessionId: this.options.sessionId, tag: this.options.tag, from: this.state, to },
+        'conn: illegal state transition ignored',
+      );
+      return false;
+    }
+    this.state = to;
+    return true;
+  }
+
+  /** Current connection state (read-only; for diagnostics and tests). */
+  get connState(): OutgoingState {
+    return this.state;
   }
 
   async start(): Promise<void> {
@@ -292,8 +324,8 @@ class OutgoingConnection {
 
   /** Mark the STT socket ready and flush media buffered while it was down. */
   private handleSttOpen(): void {
-    if (this.closed || this.draining || this.started) return;
-    this.started = true;
+    if (this.state !== 'buffering') return;
+    this.transition('streaming');
     this.utteranceStartSec = nowSec();
     logger.debug({ sessionId: this.options.sessionId, tag: this.options.tag }, 'conn: started');
 
@@ -306,8 +338,8 @@ class OutgoingConnection {
   }
 
   handleMedia(media: { payload: Buffer }): void {
-    if (this.draining || this.closed) return;
-    if (!this.started) {
+    if (this.state === 'draining' || this.state === 'closed') return;
+    if (this.state === 'buffering') {
       // The JVB can send media before our backend is ready; buffer instead of
       // dropping. Cap at ~10s of audio so a stuck backend can't grow memory.
       if (this.pendingMedia.length < 500) {
@@ -398,8 +430,8 @@ class OutgoingConnection {
    * Never throws: a stuck backend must not hang session teardown forever.
    */
   async drainAndClose(): Promise<void> {
-    if (this.closed) return;
-    this.draining = true;
+    if (this.state === 'closed') return;
+    this.transition('draining');
 
     try {
       await Promise.allSettled([...this.inFlightDecodes]);
@@ -443,8 +475,7 @@ class OutgoingConnection {
         'conn: drain failed, closing anyway',
       );
     } finally {
-      this.draining = false;
-      this.closed = true;
+      this.transition('closed');
       try {
         await this.decoder.close();
       } catch {
@@ -461,8 +492,8 @@ class OutgoingConnection {
 
   /** Immediate teardown without the end-of-stream handshake (tests/legacy). */
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
+    if (this.state === 'closed') return;
+    this.transition('closed');
     void this.decoder.close();
     void this.options.stt.close();
     this.options.onClosed(this.options.tag);

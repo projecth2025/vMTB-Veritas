@@ -192,6 +192,8 @@ const claimedRow = {
   status: 'PROCESSING',
   transcript_object_key: null,
   error_message: null,
+  claimed_at: '2026-11-25T00:00:00Z',
+  attempts: 1,
 };
 
 // The live claim_meeting_transcript RPC (LANGUAGE sql, UPDATE ... RETURNING *)
@@ -223,6 +225,13 @@ describe('claim', () => {
     expect(await store.claim('m1')).toBeNull();
   });
 
+  it('returns null for a real row that is not PROCESSING (never processes a FAILED row)', async () => {
+    const { client } = rpcClient({ data: { ...claimedRow, status: 'FAILED' } });
+    const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
+
+    expect(await store.claim('m1')).toBeNull();
+  });
+
   it('throws when the RPC errors', async () => {
     const { client } = rpcClient({ error: { message: 'db down' } });
     const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
@@ -232,15 +241,20 @@ describe('claim', () => {
 });
 
 describe('complete', () => {
-  it('passes the artifact fields through', async () => {
+  it('passes the artifact fields and claim token through', async () => {
     const { client, calls } = rpcClient({ data: claimedRow });
     const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
 
-    await store.complete('m1', 'meetings/m1/transcript/transcript-v1.json', 1, { summary: 'x' });
+    await store.complete('m1', 'meetings/m1/transcript/transcript-v1.json', 1, { summary: 'x' }, '2026-11-25T00:00:00Z');
 
     expect(calls[0]).toMatchObject({
       fn: 'complete_meeting_transcript',
-      params: { p_meeting_id: 'm1', p_version: 1, p_mom: { summary: 'x' } },
+      params: {
+        p_meeting_id: 'm1',
+        p_version: 1,
+        p_mom: { summary: 'x' },
+        p_claimed_at: '2026-11-25T00:00:00Z',
+      },
     });
   });
 
@@ -248,6 +262,20 @@ describe('complete', () => {
     const { client } = rpcClient({ error: { message: 'db down' } });
     const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
 
-    await expect(store.complete('m1', 'k', 1, null)).rejects.toThrow('complete_meeting_transcript: db down');
+    await expect(store.complete('m1', 'k', 1, null, null)).rejects.toThrow('complete_meeting_transcript: db down');
+  });
+});
+
+describe('fail', () => {
+  it('passes the claim token through', async () => {
+    const { client, calls } = rpcClient({ data: claimedRow });
+    const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
+
+    await store.fail('m1', 'boom', '2026-11-25T00:00:00Z');
+
+    expect(calls[0]).toMatchObject({
+      fn: 'fail_meeting_transcript',
+      params: { p_meeting_id: 'm1', p_error_message: 'boom', p_claimed_at: '2026-11-25T00:00:00Z' },
+    });
   });
 });

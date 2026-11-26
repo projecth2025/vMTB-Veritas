@@ -126,8 +126,14 @@ jobs:
       #
       # Delivery safety: ack-deadline 300 covers the 3-minute live-session
       # grace + retries inside one delivery (60s redelivered mid-flight), and a
-      # dead-letter topic with 5 attempts bounds runaway redelivery - an Oct
-      # 2026 reprocessing loop kept both Cloud Run services warm for days.
+      # dead-letter topic bounds runaway redelivery - an Oct 2026 reprocessing
+      # loop kept both Cloud Run services warm for days.
+      #
+      # Retry backoff 60s..600s with 10 attempts spans ~1h, i.e. past the 600s
+      # transcript lease 3 times: a delivery that hits a live lease is answered
+      # 503, and if that lease holder died, a later retry reclaims the job
+      # (issue #69). Without a backoff the retries land within seconds, all
+      # inside the lease, and the job is dead-lettered instead of recovered.
       - name: Wire Pub/Sub push subscription
         run: |
           set -euo pipefail
@@ -153,14 +159,18 @@ jobs:
             --push-auth-service-account="${RUNTIME_SA}@${PROJECT_ID}.iam.gserviceaccount.com" \
             --ack-deadline=300 \
             --dead-letter-topic="$DLQ" \
-            --max-delivery-attempts=5 \
+            --max-delivery-attempts=10 \
+            --min-retry-delay=60s \
+            --max-retry-delay=600s \
           || gcloud pubsub subscriptions update meeting-transcripts-worker \
             --project "$PROJECT_ID" \
             --push-endpoint="${WORKER_URL}/pubsub/push" \
             --push-auth-service-account="${RUNTIME_SA}@${PROJECT_ID}.iam.gserviceaccount.com" \
             --ack-deadline=300 \
             --dead-letter-topic="$DLQ" \
-            --max-delivery-attempts=5
+            --max-delivery-attempts=10 \
+            --min-retry-delay=60s \
+            --max-retry-delay=600s
 
           # Dead-lettering also needs the service agent to ack the original
           # message on this subscription; without it nothing is forwarded and

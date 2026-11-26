@@ -29,6 +29,24 @@ idempotent and safe to call repeatedly. For the VM it requires GCP
 default `https://server-vmtb-v2.3billionpairs.com`) — GCP flips to RUNNING
 before nginx/prosody finish booting, and joining in that window is what
 produced `ERR_CONNECTION_REFUSED` / “disconnected from the meeting”.
+
+**VM status is never inferred from "is it RUNNING?".** Both endpoints go
+through one pure function, `vm_action(status, intent)`, which maps each GCP
+instance status to the call that status will actually accept. The waiting room
+polls `/start-jitsi` every 5 s, so without this a single boot issued a
+`start()` on every poll, and a `start()` landed on instances that were already
+shutting down:
+
+| GCP status | `/start-jitsi` | `/stop-jitsi` |
+| --- | --- | --- |
+| `RUNNING` | probe the public origin → `ready` or `starting` | stop |
+| `PROVISIONING`, `STAGING` | `starting`, **no call** | deferred, **no call** |
+| `STOPPING` | `starting`, **no call** | `stopping`, **no call** |
+| `TERMINATED` | start | already stopped |
+| `SUSPENDING` | `starting`, **no call** | stop |
+| `SUSPENDED` | **resume** (not start) | stop |
+| `REPAIRING`, unknown | error, naming the status | error, naming the status (5xx) |
+
 `POST /stop-jitsi` only stops the
 VM — the Cloud Run services are deliberately left alone, since they're
 request-driven and Cloud Run reaps them automatically (the STT service also
@@ -42,13 +60,34 @@ fail-closed: without a mintable ID token the worker skips the POST entirely,
 and a 401/4xx answer is treated as terminal (one attempt, no retry) so a
 misconfiguration can never turn into a request loop.
 
+**Every automatic stop goes through one decision.** `/stop-jitsi` applies the
+same guards as `/reap-idle` (below) before it calls GCP, so the worker's
+edge-triggered stop and the scheduler's level-triggered reaper can never
+disagree about whether the VM is safe to stop. Only an explicit `?force=true`
+skips them (an operator overriding the guards by hand). If any guard cannot be
+*read* — Supabase or Monitoring is down — the stop is skipped, never forced
+through.
+
+What that means after a meeting: the traffic guard looks back
+`VM_IDLE_MINUTES` (10), which still includes the meeting that just ended, so
+the worker's post-meeting stop is normally **skipped** and the reaper does the
+stop on a later tick, about 10–40 min after the meeting instead of ~3–4 min.
+That is accepted deliberately (a few cents per meeting on `e2-medium`, in
+exchange for no stop ever ending a live call), but it means the
+`vmtb-reap-idle` Cloud Scheduler job (below) is now **required**: without it
+the VM never stops automatically after a meeting.
+
+Self-check: `python jitsi-activation-backend/check_vm_action.py` (the status
+table above, plus the endpoint's GCP calls and the shared guards).
+
 **Idle reaper (`POST /reap-idle`).** The worker's stop is *edge-triggered*:
 it only fires after a `meeting.completed` event. Any VM boot without that
 event — an abandoned waiting room, a lost Pub/Sub delivery, a worker outage —
 used to leak the VM, on and billing, until someone stopped it by hand. The
 reaper is the level-triggered backstop: a Cloud Scheduler job calls it every
 30 minutes, and it stops the VM only when **every** guard says nobody needs
-it (cheap checks first):
+it. The guards live in `evaluate_stop_guards()` and are shared with
+`/stop-jitsi` (cheap checks first):
 
 1. VM not `RUNNING` → nothing to do;
 2. **boot grace** — booted less than `VM_IDLE_MINUTES` ago (default 10) →

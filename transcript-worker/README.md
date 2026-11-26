@@ -4,7 +4,9 @@ Post-meeting transcript worker for the vMTB transcription pipeline. Triggered by
 a Google Cloud Pub/Sub push subscription, it:
 
 1. **claims** a meeting (idempotent, atomic `PENDING → PROCESSING` via
-   `claim_meeting_transcript`) — the worker's idempotency lock
+   `claim_meeting_transcript`) — the worker's idempotency lock. A row left
+   `PROCESSING` by a worker that died mid-job is reclaimed once its lease
+   expires, so a transcript can never be stuck
 2. **reads** the ordered final transcript segments from Supabase
 3. **uploads** transcript artifacts to Google Cloud Storage
    (`gs://<bucket>/meetings/<meeting_id>/transcript/transcript-v1.{json,txt}`)

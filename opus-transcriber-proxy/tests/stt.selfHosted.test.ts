@@ -218,3 +218,104 @@ describe('SelfHostedSTTProvider', () => {
     await server.close();
   });
 });
+
+/**
+ * The provider used to track `closed`, `draining` and a retry counter as
+ * separate fields, so it could be "closed" and still be scheduled to
+ * reconnect, or stay "draining" forever after a reconnect. These cases pin the
+ * single `state` field and its guarded transitions, including the
+ * reconnecting -> gave_up terminal state.
+ */
+describe('SelfHostedSTTProvider state transitions', () => {
+  it('walks idle -> connecting -> streaming on connect', async () => {
+    const server = await startFakeSttServer();
+    const provider = new SelfHostedSTTProvider({ url: server.url, maxRetries: 0 });
+
+    expect(provider.sttState).toBe('idle');
+    await provider.connect();
+    expect(provider.sttState).toBe('streaming');
+
+    await provider.close();
+    expect(provider.sttState).toBe('closed');
+    await server.close();
+  });
+
+  it('streaming -> draining on end-of-stream, then closed', async () => {
+    const server = await startFakeSttServer();
+    const provider = new SelfHostedSTTProvider({ url: server.url, maxRetries: 0 });
+
+    await provider.connect();
+    provider.sendEndOfStream();
+    expect(provider.sttState).toBe('draining');
+
+    await provider.close();
+    expect(provider.sttState).toBe('closed');
+    await server.close();
+  });
+
+  it('streaming -> reconnecting -> streaming across a background reconnect', async () => {
+    const server = await startFakeSttServer();
+    // Long backoff so the reconnecting state is observable before it succeeds.
+    const provider = new SelfHostedSTTProvider({ url: server.url, maxRetries: 3, retryDelayMs: 300 });
+
+    await provider.connect();
+    expect(provider.sttState).toBe('streaming');
+
+    server.socket()?.close(); // unexpected close -> reconnecting
+    await new Promise((r) => setTimeout(r, 50));
+    expect(provider.sttState).toBe('reconnecting');
+
+    await new Promise((r) => setTimeout(r, 700)); // reopen succeeds
+    expect(provider.sttState).toBe('streaming');
+
+    await provider.close();
+    await server.close();
+  });
+
+  it('reconnecting -> gave_up once the retry budget is spent, and stays there', async () => {
+    const provider = new SelfHostedSTTProvider({
+      url: 'ws://127.0.0.1:1/client/ws/speech',
+      maxRetries: 1,
+      retryDelayMs: 10,
+    });
+    const onError = vi.fn();
+    provider.onError = onError;
+
+    await expect(provider.connect()).rejects.toThrow();
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(provider.sttState).toBe('gave_up');
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('max reconnect') }),
+    );
+
+    // gave_up is terminal: no further attempts, no state drift.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(provider.sttState).toBe('gave_up');
+
+    // ...but the provider can still be torn down cleanly.
+    await provider.close();
+    expect(provider.sttState).toBe('closed');
+  });
+
+  it('connect() after close() starts a fresh attempt with a clean retry budget', async () => {
+    const server = await startFakeSttServer();
+    const provider = new SelfHostedSTTProvider({ url: server.url, maxRetries: 1, retryDelayMs: 10 });
+    const onOpen = vi.fn();
+    provider.onOpen = onOpen;
+
+    await provider.connect();
+    expect(provider.sttState).toBe('streaming');
+
+    await provider.close();
+    expect(provider.sttState).toBe('closed');
+
+    // A closed provider is reusable: it must not come back as draining.
+    await provider.connect();
+    expect(provider.sttState).toBe('streaming');
+    expect(onOpen).toHaveBeenCalledTimes(2);
+
+    await provider.close();
+    await server.close();
+  });
+});

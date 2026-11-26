@@ -237,6 +237,47 @@ def vm_status() -> str:
     return vm_instance().status or "UNKNOWN"
 
 
+# GCP instance statuses: PROVISIONING, STAGING, RUNNING, STOPPING, SUSPENDING,
+# SUSPENDED, REPAIRING, TERMINATED.
+#
+# The single source of truth for what /start-jitsi and /stop-jitsi may do in
+# each one. Every transition is explicit here so neither endpoint has to guess
+# from "is it RUNNING?" - which is what used to issue start() during STOPPING
+# and a second start() on every waiting-room poll while the VM booted.
+#
+# Actions:
+#   probe           RUNNING: check the public HTTPS origin before saying ready
+#   start           TERMINATED: call GCP start
+#   resume          SUSPENDED: call GCP resume (start would be wrong here)
+#   wait            already in the requested direction: make no GCP call
+#   stop            call GCP stop
+#   already_stopped TERMINATED on the stop intent: nothing to do
+#   error           REPAIRING or an unknown status: refuse and say why
+_VM_ACTIONS: dict[str, dict[str, str]] = {
+    "RUNNING": {"start": "probe", "stop": "stop"},
+    "PROVISIONING": {"start": "wait", "stop": "wait"},
+    "STAGING": {"start": "wait", "stop": "wait"},
+    "STOPPING": {"start": "wait", "stop": "wait"},
+    "TERMINATED": {"start": "start", "stop": "already_stopped"},
+    "SUSPENDING": {"start": "wait", "stop": "stop"},
+    "SUSPENDED": {"start": "resume", "stop": "stop"},
+    "REPAIRING": {"start": "error", "stop": "error"},
+}
+
+
+def vm_action(status: str, intent: str) -> str:
+    """Pure mapping of a GCP instance status to the call we may make.
+
+    ``intent`` is ``"start"`` or ``"stop"``. Unknown statuses (and REPAIRING)
+    map to ``"error"`` so the caller reports the status instead of firing a
+    GCP call at an instance that is not in a state that accepts it.
+    """
+    row = _VM_ACTIONS.get(status)
+    if row is None:
+        return "error"
+    return row[intent]
+
+
 def probe_jitsi_public() -> bool:
     """GET the public Jitsi origin (no auth) — true when nginx is serving.
 
@@ -623,9 +664,14 @@ def start_jitsi(current_user: Optional[dict] = Depends(get_current_user)) -> dic
     # 1. Jitsi VM (JVB / Prosody / Jicofo)
     #    GCP RUNNING alone is not enough — also require the public HTTPS
     #    origin to answer, so clients never race nginx/prosody during boot.
+    #    The status->action mapping is vm_action(); never infer it here.
     try:
         status = vm_status()
-        if status == "RUNNING":
+        action = vm_action(status, "start")
+        if action == "error":
+            log.warning("%s: refusing to start (status=%s)", cfg.instance_name, status)
+            components["jvb"] = {"state": "error", "detail": f"vm status {status}"}
+        elif action == "probe":
             if probe_jitsi_public():
                 components["jvb"] = {"state": "ready"}
             else:
@@ -638,7 +684,19 @@ def start_jitsi(current_user: Optional[dict] = Depends(get_current_user)) -> dic
                     "state": "starting",
                     "detail": "vm running; waiting for jitsi https",
                 }
-        else:
+        elif action == "wait":
+            # Already booting / shutting down / suspending: issuing another
+            # call here is at best a no-op and at worst an error the waiting
+            # room would surface as "jvb: error".
+            log.info("%s: start deferred (status=%s)", cfg.instance_name, status)
+            components["jvb"] = {"state": "starting", "detail": f"vm {status}"}
+        elif action == "resume":
+            log.info("%s: resuming (status=%s)", cfg.instance_name, status)
+            compute_client().resume(
+                project=cfg.project_id, zone=cfg.zone, instance=cfg.instance_name
+            )
+            components["jvb"] = {"state": "starting", "detail": f"vm {status}"}
+        else:  # "start"
             log.info("%s: starting (status=%s)", cfg.instance_name, status)
             compute_client().start(
                 project=cfg.project_id, zone=cfg.zone, instance=cfg.instance_name
@@ -675,13 +733,20 @@ def start_jitsi(current_user: Optional[dict] = Depends(get_current_user)) -> dic
 
 
 @app.post("/stop-jitsi")
-def stop_jitsi(current_user: Optional[dict] = Depends(get_current_user)):
+def stop_jitsi(
+    current_user: Optional[dict] = Depends(get_current_user),
+    force: bool = False,
+):
     """Stop the billable VM.
 
     The Cloud Run services are intentionally left alone: they are
     request-driven and Cloud Run reaps their instances automatically once the
     meeting's WebSockets close (the STT service additionally closes sessions
     after an idle window). There is no resident-GPU state to clean up anymore.
+
+    Unless ``force=true`` is passed, the same guards the idle reaper uses must
+    all say nobody needs the VM before it is stopped - so every automatic stop
+    goes through one decision (see ``evaluate_stop_guards``).
 
     Authentication: Requires valid Google ID token from transcript-worker.
     A join ticket is not enough: any participant could end everyone's meeting.
@@ -694,9 +759,31 @@ def stop_jitsi(current_user: Optional[dict] = Depends(get_current_user)):
 
     try:
         status = vm_status()
-        if status == "TERMINATED":
+        action = vm_action(status, "stop")
+        if action == "error":
+            log.warning("%s: refusing to stop (status=%s)", cfg.instance_name, status)
+            components["jvb"] = {"state": "error", "detail": f"vm status {status}"}
+            stop_error = RuntimeError(f"vm status {status}")
+        elif action == "already_stopped":
             components["jvb"] = {"state": "stopped"}
-        else:
+        elif action == "wait":
+            # Booting or already shutting down: no call. The reaper picks it
+            # up once it settles.
+            log.info("%s: stop deferred (status=%s)", cfg.instance_name, status)
+            components["jvb"] = {"state": "stopping", "detail": f"vm {status}"}
+        else:  # "stop"
+            # The guards answer "is anyone using a RUNNING VM?"; every other
+            # stoppable status has no live workload to protect.
+            if not force and status == "RUNNING":
+                safe, reason, _detail = evaluate_stop_guards()
+                if not safe:
+                    log.info("/stop-jitsi skipped: %s", reason)
+                    payload = {
+                        "status": "skipped",
+                        "reason": reason,
+                        "components": {**components, "jvb": {"state": "in-use", "detail": reason}},
+                    }
+                    return JSONResponse(status_code=200, content=payload)
             log.info("%s: stopping (status=%s)", cfg.instance_name, status)
             compute_client().stop(
                 project=cfg.project_id, zone=cfg.zone, instance=cfg.instance_name
@@ -732,6 +819,100 @@ def _parse_rfc3339(raw: str) -> Optional[datetime]:
         return None
 
 
+def evaluate_stop_guards() -> tuple[bool, str, dict[str, Any]]:
+    """The one "is it safe to stop the VM?" decision.
+
+    Shared by /reap-idle and /stop-jitsi so every automatic stop sees the same
+    five signals. Returns ``(safe, reason, detail)``; ``safe=False`` means
+    skip, never stop, and ``reason`` names the guard (or the unreadable
+    signal). Anyone failing to READ a signal means "unknown", and unknown never
+    stops the VM: fail safe is skip, not stop.
+
+    Guards, in order (cheap first):
+      1. VM not RUNNING            - nothing to stop
+      2. boot grace                - booted less than VM_IDLE_MINUTES ago
+      3. recent waiting-room poll  - /start-jitsi polled within VM_IDLE_MINUTES
+      4. live meeting heartbeat    - a meeting_sessions heartbeat within
+                                     VM_HEARTBEAT_GRACE_MINUTES
+      5. VM network traffic        - >= VM_ACTIVE_TRAFFIC_BYTES over the last
+                                     VM_IDLE_MINUTES (Cloud Monitoring)
+    """
+    now = datetime.now(timezone.utc)
+    idle_seconds = cfg.vm_idle_minutes * 60
+
+    try:
+        instance = vm_instance()
+    except Exception as exc:  # noqa: BLE001 - GCP read failure: skip, retry next tick
+        log.warning("stop-guards: cannot read %s: %s", cfg.instance_name, exc)
+        return False, "cannot read instance (fail-safe)", {}
+
+    status = instance.status or "UNKNOWN"
+    if status != "RUNNING":
+        return False, f"vm {status.lower()}", {}
+
+    # Guard 2: boot grace. GCP exposes last_start_timestamp on the instance.
+    started = _parse_rfc3339(getattr(instance, "last_start_timestamp", "") or "")
+    if started is None:
+        return False, "no last_start_timestamp (fail-safe)", {}
+    uptime = (now - started).total_seconds()
+    if uptime < idle_seconds:
+        return (
+            False,
+            f"booted {int(uptime)}s ago (< {int(idle_seconds)}s boot grace)",
+            {"uptime_seconds": uptime},
+        )
+
+    # Guard 3: waiting-room polling. "Never recorded" (manual gcloud start)
+    # falls through to the heartbeat guard; "cannot read" fails safe.
+    try:
+        last_poll = last_start_poll_at()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("stop-guards: cannot read jitsi_vm_activity: %s", exc)
+        return False, "cannot read poll activity (fail-safe)", {"uptime_seconds": uptime}
+    poll_idle: Optional[float] = None
+    if last_poll is not None:
+        poll_idle = (now - last_poll).total_seconds()
+        if poll_idle < idle_seconds:
+            return (
+                False,
+                f"waiting-room poll {int(poll_idle)}s ago",
+                {"uptime_seconds": uptime, "poll_idle_seconds": poll_idle},
+            )
+
+    # Guard 4: someone is in a meeting right now.
+    try:
+        if has_active_meeting(cfg.heartbeat_grace_minutes):
+            return (
+                False,
+                "active meeting heartbeat",
+                {"uptime_seconds": uptime, "poll_idle_seconds": poll_idle},
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("stop-guards: cannot read meeting_sessions: %s", exc)
+        return False, "cannot read meeting sessions (fail-safe)", {"uptime_seconds": uptime, "poll_idle_seconds": poll_idle}
+
+    # Guard 5: traffic - the one signal no browser can fake.
+    try:
+        traffic = vm_network_bytes(str(instance.id), cfg.vm_idle_minutes)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("stop-guards: cannot read %s traffic: %s", cfg.instance_name, exc)
+        return False, "cannot read vm traffic (fail-safe)", {"uptime_seconds": uptime, "poll_idle_seconds": poll_idle}
+    if traffic is None:
+        return False, "no vm traffic samples (fail-safe)", {"uptime_seconds": uptime, "poll_idle_seconds": poll_idle}
+    if traffic >= cfg.active_traffic_bytes:
+        return (
+            False,
+            f"vm traffic {traffic / 1e6:.1f} MB in {int(cfg.vm_idle_minutes)} min",
+            {"uptime_seconds": uptime, "poll_idle_seconds": poll_idle, "traffic_bytes": traffic},
+        )
+
+    return True, "idle", {
+        "uptime_seconds": uptime,
+        "poll_idle_seconds": poll_idle,
+        "traffic_bytes": traffic,
+    }
+
+
 @app.post("/reap-idle")
 def reap_idle(caller: dict = Depends(get_reap_caller)):
     """Stop the VM when nothing has needed it for VM_IDLE_MINUTES.
@@ -743,84 +924,15 @@ def reap_idle(caller: dict = Depends(get_reap_caller)):
     backstop: Cloud Scheduler calls it every ~30 min, and it stops the VM only
     when EVERY guard says nobody needs it.
 
-    Guards, in order (cheap first; each returns {"status": "skipped", why}):
-      1. VM not RUNNING            - nothing to do
-      2. boot grace                - booted less than VM_IDLE_MINUTES ago
-         (protects a user still sitting in the waiting room)
-      3. recent waiting-room poll  - /start-jitsi polled within VM_IDLE_MINUTES
-      4. live meeting heartbeat    - a meeting_sessions heartbeat within
-         VM_HEARTBEAT_GRACE_MINUTES
-      5. VM network traffic        - >= VM_ACTIVE_TRAFFIC_BYTES over the last
-         VM_IDLE_MINUTES (Cloud Monitoring). Guard 4 alone is forgeable:
-         meeting_sessions is browser-writable while its RLS is off, so anyone
-         with the anon key could mark a live meeting ended.
-    Anyone failing to READ a signal (Supabase down) means "unknown", and
-    unknown NEVER stops the VM: fail safe is skip, not stop.
+    The guards themselves live in ``evaluate_stop_guards`` - the same five
+    /stop-jitsi applies - so the two stoppers can never disagree.
 
     Auth: Google ID token only (REAPER_AUDIENCE / REAPER_SERVICE_ACCOUNT),
     like /stop-jitsi - a join ticket can never drive a stop.
     """
-    now = datetime.now(timezone.utc)
-    idle_seconds = cfg.vm_idle_minutes * 60
-
-    try:
-        instance = vm_instance()
-    except Exception as exc:  # noqa: BLE001 - GCP read failure: skip, retry next tick
-        log.warning("reaper: cannot read %s: %s", cfg.instance_name, exc)
-        return {"status": "skipped", "reason": "cannot read instance (fail-safe)"}
-
-    status = instance.status or "UNKNOWN"
-    if status != "RUNNING":
-        return {"status": "skipped", "reason": f"vm {status.lower()}"}
-
-    # Guard 2: boot grace. GCP exposes last_start_timestamp on the instance.
-    started = _parse_rfc3339(getattr(instance, "last_start_timestamp", "") or "")
-    if started is None:
-        return {"status": "skipped", "reason": "no last_start_timestamp (fail-safe)"}
-    uptime = (now - started).total_seconds()
-    if uptime < idle_seconds:
-        return {
-            "status": "skipped",
-            "reason": f"booted {int(uptime)}s ago (< {int(idle_seconds)}s boot grace)",
-        }
-
-    # Guard 3: waiting-room polling. "Never recorded" (manual gcloud start)
-    # falls through to the heartbeat guard; "cannot read" fails safe.
-    try:
-        last_poll = last_start_poll_at()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("reaper: cannot read jitsi_vm_activity: %s", exc)
-        return {"status": "skipped", "reason": "cannot read poll activity (fail-safe)"}
-    poll_idle: Optional[float] = None
-    if last_poll is not None:
-        poll_idle = (now - last_poll).total_seconds()
-        if poll_idle < idle_seconds:
-            return {
-                "status": "skipped",
-                "reason": f"waiting-room poll {int(poll_idle)}s ago",
-            }
-
-    # Guard 4: someone is in a meeting right now.
-    try:
-        if has_active_meeting(cfg.heartbeat_grace_minutes):
-            return {"status": "skipped", "reason": "active meeting heartbeat"}
-    except Exception as exc:  # noqa: BLE001
-        log.warning("reaper: cannot read meeting_sessions: %s", exc)
-        return {"status": "skipped", "reason": "cannot read meeting sessions (fail-safe)"}
-
-    # Guard 5: traffic - the one signal no browser can fake (see docstring).
-    try:
-        traffic = vm_network_bytes(str(instance.id), cfg.vm_idle_minutes)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("reaper: cannot read %s traffic: %s", cfg.instance_name, exc)
-        return {"status": "skipped", "reason": "cannot read vm traffic (fail-safe)"}
-    if traffic is None:
-        return {"status": "skipped", "reason": "no vm traffic samples (fail-safe)"}
-    if traffic >= cfg.active_traffic_bytes:
-        return {
-            "status": "skipped",
-            "reason": f"vm traffic {traffic / 1e6:.1f} MB in {int(cfg.vm_idle_minutes)} min",
-        }
+    safe, reason, detail = evaluate_stop_guards()
+    if not safe:
+        return {"status": "skipped", "reason": reason}
 
     # Every guard passed. Stop the billable VM (Cloud Run services stay as-is:
     # scale-to-zero, request-driven).
@@ -835,17 +947,19 @@ def reap_idle(caller: dict = Depends(get_reap_caller)):
             content={"status": "error", "reason": f"stop failed: {exc}"},
         )
 
+    uptime = detail.get("uptime_seconds")
+    poll_idle = detail.get("poll_idle_seconds")
     log.info(
         "reaper: stopped %s (up %ds, %s)",
         cfg.instance_name,
-        int(uptime),
+        int(uptime or 0),
         f"last poll {int(poll_idle)}s ago" if poll_idle is not None else "no poll ever recorded",
     )
     return {
         "status": "stopped",
-        "uptime_seconds": int(uptime),
-        "poll_idle_seconds": int(poll_idle) if poll_idle is not None else None,
-        "traffic_bytes": traffic,
+        "uptime_seconds": int(uptime or 0),
+        "poll_idle_seconds": poll_idle,
+        "traffic_bytes": detail.get("traffic_bytes"),
     }
 
 
