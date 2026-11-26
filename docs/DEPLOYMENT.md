@@ -312,8 +312,11 @@ gcloud storage buckets create gs://vmtb-transcripts \
 
 # Pub/Sub topic + a push subscription (fill in the real worker URL once deployed)
 # ack-deadline 300: one delivery re-checks live-session heartbeats for up to
-# ~4 min (60s redelivered mid-flight). The DLQ + 5 attempts bound runaway
-# redelivery — see "Resolved incidents" in docs/LEGACY_AND_KNOWN_ISSUES.md.
+# ~4 min (60s redelivered mid-flight). The DLQ bounds runaway redelivery — see
+# "Resolved incidents" in docs/LEGACY_AND_KNOWN_ISSUES.md. The 60s..600s retry
+# backoff x 10 attempts (~1h) outlasts the 600s transcript lease, so a job whose
+# worker died is reclaimed instead of dead-lettered — see "Lease and attempts"
+# in docs/MEETING_TRANSCRIPTION_PIPELINE.md.
 gcloud pubsub topics create meeting-transcripts
 gcloud pubsub topics create meeting-transcripts-dead-letter
 gcloud pubsub topics add-iam-policy-binding meeting-transcripts-dead-letter \
@@ -325,7 +328,9 @@ gcloud pubsub subscriptions create meeting-transcripts-worker \
   --push-auth-service-account=YOUR_PROJECT_NUMBER-compute@developer.gserviceaccount.com \
   --ack-deadline=300 \
   --dead-letter-topic=projects/YOUR_PROJECT_ID/topics/meeting-transcripts-dead-letter \
-  --max-delivery-attempts=5
+  --max-delivery-attempts=10 \
+  --min-retry-delay=60s \
+  --max-retry-delay=600s
 # Dead-lettering also needs the service agent to ack on the subscription,
 # otherwise nothing is forwarded and redelivery stays unbounded.
 gcloud pubsub subscriptions add-iam-policy-binding meeting-transcripts-worker \
@@ -956,10 +961,13 @@ gcloud run services describe stt-service --project YOUR_PROJECT_ID \
     fails). Auth is **fail-closed**: no Google ID token → no POST (never
     "proceed without auth"), and a 4xx answer is terminal rather than
     retried through the whole budget. Requires the loader's Supabase
-    analytics to be running — it is, automatically. Watch for
-    `vm: /stop-jitsi fired successfully` in worker logs. Delivery safety
-    (`ack-deadline=300`, dead-letter topic, 5 attempts) is wired by the
-    worker deploy workflow — §2.2 for the manual equivalent.
+    analytics to be running — it is, automatically. `/stop-jitsi` applies
+    the reaper's guards (issue #69), and right after a meeting the VM-traffic
+    guard still counts that meeting, so expect `/stop-jitsi skipped` here and
+    the reaper below to do the actual stop. Delivery safety
+    (`ack-deadline=300`, dead-letter topic, 10 attempts with 60–600 s retry
+    backoff) is wired by the worker deploy workflow — §2.2 for the manual
+    equivalent.
   - *Backstop:* `POST $ACT_URL/reap-idle`, invoked by Cloud Scheduler every
     30 min, catches every boot that never produced a `meeting.completed`
     event (abandoned waiting room, lost delivery, worker outage) — the leak

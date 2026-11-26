@@ -68,6 +68,15 @@ skips them (an operator overriding the guards by hand). If any guard cannot be
 *read* — Supabase or Monitoring is down — the stop is skipped, never forced
 through.
 
+What that means after a meeting: the traffic guard looks back
+`VM_IDLE_MINUTES` (10), which still includes the meeting that just ended, so
+the worker's post-meeting stop is normally **skipped** and the reaper does the
+stop on a later tick, about 10–40 min after the meeting instead of ~3–4 min.
+That is accepted deliberately (a few cents per meeting on `e2-medium`, in
+exchange for no stop ever ending a live call), but it means the
+`vmtb-reap-idle` Cloud Scheduler job (below) is now **required**: without it
+the VM never stops automatically after a meeting.
+
 Self-check: `python jitsi-activation-backend/check_vm_action.py` (the status
 table above, plus the endpoint's GCP calls and the shared guards).
 

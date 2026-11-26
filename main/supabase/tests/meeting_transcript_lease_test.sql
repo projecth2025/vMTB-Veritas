@@ -1,13 +1,25 @@
 -- Scenario tests for 20261125_meeting_transcript_lease.sql (lease, attempts,
--- claim token), run against a REAL database without leaving any trace: the
--- migration and this block run inside one transaction, and the block ends by
--- raising TEST_RESULTS <json>, which aborts it.
+-- claim token). The migration and this block run inside one transaction, and
+-- the block ends by raising TEST_RESULTS <json>, which aborts it: seeing
+-- "ERROR: TEST_RESULTS {...}" with all of T1-T7 is a PASS; any other error is
+-- a failed assertion.
 --
---   { echo "BEGIN;"; cat ../migrations/20261125_meeting_transcript_lease.sql; \
---     cat meeting_transcript_lease_test.sql; echo "ROLLBACK;"; } > /tmp/run.sql
---   supabase db query --linked -f /tmp/run.sql
+-- Run it against a THROWAWAY local Postgres, never the linked production
+-- project: the script runs DDL (ALTER TABLE, DROP FUNCTION) that locks a live
+-- table even though it rolls back. From main/supabase/:
 --
--- (Once the migration is applied, run just "BEGIN;" + this file + "ROLLBACK;".)
+--   docker run -d --rm --name lease-test -e POSTGRES_PASSWORD=x \
+--     public.ecr.aws/supabase/postgres:17.6.1.156
+--   P="docker exec -i lease-test psql -U postgres -h localhost -v ON_ERROR_STOP=1 -q"
+--   # stubs for what 20260820_meeting_transcripts.sql references:
+--   $P -c "CREATE TABLE public.mtbs (id uuid PRIMARY KEY);
+--          CREATE TABLE public.mtb_members (mtb_id uuid, user_id uuid);
+--          CREATE FUNCTION public.update_updated_at_column() RETURNS trigger
+--            LANGUAGE plpgsql AS \$\$BEGIN NEW.updated_at = now(); RETURN NEW; END\$\$;"
+--   $P < migrations/20260820_meeting_transcripts.sql
+--   { echo "BEGIN;"; cat migrations/20261125_meeting_transcript_lease.sql \
+--       tests/meeting_transcript_lease_test.sql; echo "ROLLBACK;"; } | $P
+--   docker stop lease-test
 --
 -- The point of the whole change: a worker that dies between claim and
 -- complete/fail must not leave the row in PROCESSING forever. Every claim
@@ -60,7 +72,9 @@ BEGIN
        SET claimed_at = now() - make_interval(secs => public.meeting_transcript_lease_seconds() + 60)
      WHERE meeting_id = mid2;
     r := public.claim_meeting_transcript(mid2);
-    ASSERT r IS NOT NULL, 'T5 expired lease not reclaimable';
+    -- r.meeting_id, not `r IS NOT NULL`: on a row value that is true only when
+    -- every column is non-null, and a claimed row always has NULL columns.
+    ASSERT r.meeting_id IS NOT NULL, 'T5 expired lease not reclaimable';
     ASSERT r.status = 'PROCESSING', format('T5 status=%s', r.status);
     ASSERT r.attempts = 2, format('T5 attempts=%s', r.attempts);
     res := res || jsonb_build_object('T5', jsonb_build_object('reclaimed', true, 'attempts', r.attempts));

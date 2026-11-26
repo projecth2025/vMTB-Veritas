@@ -127,6 +127,19 @@ describe('server /pubsub/push', () => {
     expect(process).toHaveBeenCalled();
   });
 
+  it('returns 503 (nack) when another delivery holds a live lease', async () => {
+    const { deps, process } = makeDeps(async () => ({ kind: 'leased' }));
+    await withServer(makeConfig(), deps, async (base) => {
+      const res = await fetch(`${base}/pubsub/push`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer push-secret' },
+        body: pushBody('room-123'),
+      });
+      expect(res.status).toBe(503);
+    });
+    expect(process).toHaveBeenCalled();
+  });
+
   it('serves /health', async () => {
     const { deps } = makeDeps();
     await withServer(makeConfig(), deps, async (base) => {

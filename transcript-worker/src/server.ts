@@ -99,7 +99,14 @@ async function handlePush(req: http.IncomingMessage, res: http.ServerResponse, c
   try {
     const outcome = await deps.process(meetingId);
     logger.info({ meetingId, outcome: outcome.kind }, 'push: processed');
-    // Ack every outcome: failed meetings are marked FAILED, retrying won't help.
+    if (outcome.kind === 'leased') {
+      // Another delivery is mid-job. Nack so this message survives: it is what
+      // reclaims the job once the lease expires if that worker died.
+      res.writeHead(503);
+      res.end('Lease held; retry later');
+      return;
+    }
+    // Ack every other outcome: failed meetings are marked FAILED, retrying won't help.
     res.writeHead(200);
     res.end('OK');
   } catch (err) {

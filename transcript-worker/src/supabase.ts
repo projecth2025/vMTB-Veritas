@@ -56,9 +56,24 @@ export class SupabaseStore {
     // function as an object with every column null - which is truthy, so a
     // plain `if (!data)` check treats an *unclaimed* meeting as claimed and
     // reprocesses it (LLM + GCS + /stop-jitsi) on every redelivery. Only a
-    // row carrying our meeting_id actually won the claim.
-    if (!row || row.meeting_id == null) return null;
+    // PROCESSING row carrying our meeting_id actually won the claim.
+    if (!row || row.meeting_id == null || row.status !== 'PROCESSING') return null;
     return row;
+  }
+
+  /**
+   * The row's current status, or null when there is no row. Used after a
+   * refused claim to tell "terminal" (ack) from "live lease held by another
+   * delivery" (PROCESSING: retry later, or a dead worker's job is lost).
+   */
+  async transcriptStatus(meetingId: string): Promise<string | null> {
+    const { data, error } = await this.client
+      .from('meeting_transcripts')
+      .select('status')
+      .eq('meeting_id', meetingId)
+      .maybeSingle();
+    if (error) throw new Error(`read transcript status: ${error.message}`);
+    return (data as { status?: string } | null)?.status ?? null;
   }
 
   async fetchSegments(meetingId: string): Promise<SegmentRow[]> {

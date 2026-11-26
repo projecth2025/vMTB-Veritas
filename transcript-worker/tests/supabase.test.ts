@@ -225,6 +225,13 @@ describe('claim', () => {
     expect(await store.claim('m1')).toBeNull();
   });
 
+  it('returns null for a real row that is not PROCESSING (never processes a FAILED row)', async () => {
+    const { client } = rpcClient({ data: { ...claimedRow, status: 'FAILED' } });
+    const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);
+
+    expect(await store.claim('m1')).toBeNull();
+  });
+
   it('throws when the RPC errors', async () => {
     const { client } = rpcClient({ error: { message: 'db down' } });
     const store = new SupabaseStore('https://x.supabase.co', 'service-role', client);

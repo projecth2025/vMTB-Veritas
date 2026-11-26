@@ -126,12 +126,28 @@ forever: every Pub/Sub redelivery got "no row" back, was **acked** as
 - After `meeting_transcript_max_attempts()` (3) claims, `claim` marks the row
   `FAILED` with a clear message instead of retrying forever.
 
-So the row always ends `COMPLETED` or `FAILED` — never stuck in `PROCESSING`.
-The worker treats a claim that returns nothing as "terminal or live-claimed
-elsewhere" and acks.
+Reclaiming needs a delivery that arrives **after** the lease expires, so a
+refused claim is split by the row's status:
 
-Scenario tests: `main/supabase/tests/meeting_transcript_lease_test.sql`
-(run instructions in its header; rolls back, leaves no trace).
+- `COMPLETED` / `FAILED` / no row → ack (200).
+- still `PROCESSING` (another delivery's live lease) → **503, not acked**. If
+  that worker died, this message is the only thing left that can reclaim the
+  job. The subscription's retry backoff (60–600 s, 10 attempts, about 1 h —
+  `.github/workflows/deploy-transcript-worker.yml`) outlasts the lease, so a
+  later retry reclaims it. Without that backoff the retries all land inside the
+  lease and the message is dead-lettered instead.
+
+So the row ends `COMPLETED` or `FAILED` instead of staying in `PROCESSING`, as
+long as the subscription carries that retry policy.
+
+Rollout: apply the migration first (`p_claimed_at` defaults to NULL, so the
+worker already deployed keeps completing jobs), then deploy the worker via its
+workflow, which also updates the subscription. Follow-up once that is live:
+make `p_claimed_at` required.
+
+Scenario tests: `main/supabase/tests/meeting_transcript_lease_test.sql`. Run
+them against a throwaway local Postgres (steps in its header), never the
+linked production project.
 
 **`get_mtb_transcripts(p_mtb_id UUID)`** (`SECURITY DEFINER`, read side,
 `main/supabase/migrations/20260924_get_mtb_transcripts_session_link.sql`) —
@@ -224,7 +240,13 @@ this RPC — if it's the one actually live — remains in effect.
   (`evaluate_stop_guards` in `jitsi-activation-backend/main.py`) the reaper
   does. Every automatic stop therefore sees the same signals — waiting-room
   polls, heartbeats and VM traffic — instead of each stopper keeping its own
-  view. A caller that genuinely means it passes `force=true`.
+  view. A caller that genuinely means it passes `force=true`. The cost: right
+  after a meeting the traffic guard still counts that meeting (and short
+  meetings also trip the boot-grace / waiting-room guards), so the worker's
+  stop is usually skipped and the reaper stops the VM instead — about
+  `VM_IDLE_MINUTES` (10) plus up to one 30-min scheduler tick after the
+  meeting, versus ~3–4 min before. On the `e2-medium` VM that is a few cents
+  per meeting. It relies on the `vmtb-reap-idle` Cloud Scheduler job existing.
 - **Only FINAL segments are stored** in Supabase — clean, non-duplicated
   utterance records; interim results live only in proxy memory.
 - **Artifacts are generated post-meeting**, not during it, keeping the

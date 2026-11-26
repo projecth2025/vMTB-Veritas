@@ -53,6 +53,7 @@ function makeDeps(overrides: Partial<WorkerDeps> = {}): { deps: WorkerDeps; fake
     hasActiveSession: vi.fn().mockResolvedValue(false),
     complete: vi.fn().mockResolvedValue(undefined),
     fail: vi.fn().mockResolvedValue(undefined),
+    transcriptStatus: vi.fn().mockResolvedValue('COMPLETED'),
     upload: vi.fn().mockResolvedValue(undefined),
   };
   const gcs: GcsClient = { upload: fakes.upload };
@@ -64,6 +65,7 @@ function makeDeps(overrides: Partial<WorkerDeps> = {}): { deps: WorkerDeps; fake
       hasActiveSession: fakes.hasActiveSession,
       complete: fakes.complete,
       fail: fakes.fail,
+      transcriptStatus: fakes.transcriptStatus,
     } as never,
     gcs,
     llm: { provider: 'none', baseUrl: '', apiKey: '', model: 'gpt-4o-mini' },
@@ -131,6 +133,38 @@ describe('processMeeting', () => {
     expect(fakes.upload).not.toHaveBeenCalled();
     expect(fakes.complete).not.toHaveBeenCalled();
     expect(fakes.fail).not.toHaveBeenCalled();
+  });
+
+  // Issue #69: the delivery that hits a live lease is the only message left if
+  // the lease holder died. Acking it lost the job forever, so it must not be acked.
+  it('does not ack (leased) when the row is still PROCESSING under a live lease', async () => {
+    const { deps, fakes } = makeDeps({ vm: { activatorUrl: 'https://act.example' } });
+    fakes.claim.mockResolvedValue(null);
+    fakes.transcriptStatus.mockResolvedValue('PROCESSING');
+    const outcome = await processMeeting('m1', deps);
+    expect(outcome).toEqual({ kind: 'leased' });
+    expect(fakes.transcriptStatus).toHaveBeenCalledWith('m1');
+    expect(fakes.fetchSegments).not.toHaveBeenCalled();
+    expect(fakes.complete).not.toHaveBeenCalled();
+    expect(fakes.fail).not.toHaveBeenCalled();
+    // The lease holder owns the post-meeting stop; a retried delivery must not race it.
+    expect(fakes.hasActiveSession).not.toHaveBeenCalled();
+  });
+
+  it('acks when the refused claim is for a terminal row', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.claim.mockResolvedValue(null);
+    fakes.transcriptStatus.mockResolvedValue('FAILED');
+    expect(await processMeeting('m1', deps)).toEqual({ kind: 'already-processed' });
+    fakes.transcriptStatus.mockResolvedValue(null); // no row at all
+    expect(await processMeeting('m1', deps)).toEqual({ kind: 'already-processed' });
+  });
+
+  it('rethrows (nack) when the status read after a refused claim fails', async () => {
+    const { deps, fakes } = makeDeps();
+    fakes.claim.mockResolvedValue(null);
+    fakes.transcriptStatus.mockRejectedValue(new Error('db down'));
+    await expect(processMeeting('m1', deps)).rejects.toThrow('db down');
   });
 
   it('marks FAILED and acks when GCS upload fails', async () => {

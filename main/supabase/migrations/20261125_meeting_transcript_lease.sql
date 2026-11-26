@@ -13,8 +13,17 @@
 --   * complete/fail require the claim token (claimed_at) they were handed, so
 --     a worker presumed dead cannot overwrite a newer attempt's result.
 --
--- Lease size: the worker's worst case is the 600s Cloud Run request timeout,
--- so 10 minutes clears it with headroom.
+-- Lease size: Cloud Run kills a request at 600s, so no live worker can hold a
+-- claim longer than the 600s lease.
+--
+-- Reclaiming needs a delivery AFTER the lease expires. The worker therefore
+-- answers a delivery that hits a live lease with 503 (Pub/Sub retries later)
+-- instead of acking it, and the subscription's retry backoff spans the lease
+-- (.github/workflows/deploy-transcript-worker.yml).
+--
+-- Rollout: p_claimed_at defaults to NULL (= no token check) so the worker
+-- deployed before this migration keeps completing jobs. Apply this first,
+-- then deploy the worker. Follow-up once it is live: make the token required.
 -- ============================================================================
 
 ALTER TABLE public.meeting_transcripts
@@ -71,26 +80,32 @@ BEGIN
       )
     RETURNING * INTO v_row;
 
-    IF v_row IS NOT NULL THEN
+    -- FOUND, not `v_row IS NOT NULL`: on a row variable IS NOT NULL is true
+    -- only when EVERY column is non-null, and a claimed row always has NULLs
+    -- (mom, completed_at, transcript_object_key, mtb_id), so that test
+    -- reported every successful claim as "nothing claimed".
+    IF FOUND THEN
         RETURN v_row;
     END IF;
 
     -- Out of attempts and still stuck: fail permanently rather than spin.
+    -- Returns NULL either way: this caller did not win a claim, so it must not
+    -- process the meeting (it reads the row's status to decide ack vs retry).
     UPDATE public.meeting_transcripts
     SET status = 'FAILED',
         error_message = COALESCE(
             error_message,
             'transcript processing abandoned after ' || public.meeting_transcript_max_attempts() || ' attempts'
         ),
+        claimed_at = NULL,
         updated_at = now()
     WHERE meeting_id = p_meeting_id
       AND status = 'PROCESSING'
       AND attempts >= public.meeting_transcript_max_attempts()
       AND (claimed_at IS NULL
-           OR claimed_at < now() - make_interval(secs => public.meeting_transcript_lease_seconds()))
-    RETURNING * INTO v_row;
+           OR claimed_at < now() - make_interval(secs => public.meeting_transcript_lease_seconds()));
 
-    RETURN v_row;
+    RETURN NULL;
 END;
 $$;
 
@@ -166,11 +181,11 @@ $$;
 -- ----------------------------------------------------------------------------
 -- Grants (mirrors 20261003_revoke_public_execute_grants.sql: service_role only)
 -- ----------------------------------------------------------------------------
-REVOKE ALL ON FUNCTION public.claim_meeting_transcript(TEXT) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.complete_meeting_transcript(TEXT, TEXT, INTEGER, JSONB, TIMESTAMPTZ) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.fail_meeting_transcript(TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.meeting_transcript_lease_seconds() FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.meeting_transcript_max_attempts() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.claim_meeting_transcript(TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.complete_meeting_transcript(TEXT, TEXT, INTEGER, JSONB, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.fail_meeting_transcript(TEXT, TEXT, TIMESTAMPTZ) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.meeting_transcript_lease_seconds() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.meeting_transcript_max_attempts() FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.claim_meeting_transcript(TEXT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.complete_meeting_transcript(TEXT, TEXT, INTEGER, JSONB, TIMESTAMPTZ) TO service_role;

@@ -79,6 +79,8 @@ async function defaultFetchIdToken(audience: string): Promise<string> {
 export type Outcome =
   | { kind: 'completed' }
   | { kind: 'already-processed' }
+  /** Another delivery holds a live lease: not acked, so Pub/Sub retries later. */
+  | { kind: 'leased' }
   | { kind: 'failed'; error: string };
 
 export interface TranscriptArtifact {
@@ -116,8 +118,11 @@ export interface TranscriptArtifact {
  * the same immutable meeting won't fix it, so we record the failure instead.
  * Only infra failures during the claim itself are left to Pub/Sub redelivery.
  *
- * A claim that returns nothing means the row is terminal (COMPLETED/FAILED) or
- * is live-claimed elsewhere; either way there is nothing to do, so we ack.
+ * A claim that returns nothing means the row is terminal (COMPLETED/FAILED),
+ * unknown, or still PROCESSING under another delivery's live lease. Terminal
+ * and unknown are acked. A live lease is NOT acked (`leased` -> 503): if that
+ * other worker died, this message is the only thing that can bring the job
+ * back once the lease expires, so Pub/Sub must keep retrying it.
  */
 export async function processMeeting(meetingId: string, deps: WorkerDeps, now = Date.now): Promise<Outcome> {
   let claimed;
@@ -130,6 +135,11 @@ export async function processMeeting(meetingId: string, deps: WorkerDeps, now = 
   }
 
   if (!claimed?.meeting_id) {
+    // Throws on a DB error -> 500 -> redelivered, same as a failed claim.
+    if ((await deps.supabase.transcriptStatus(meetingId)) === 'PROCESSING') {
+      logger.info({ meetingId }, 'worker: live lease held by another delivery; asking Pub/Sub to retry later');
+      return { kind: 'leased' };
+    }
     logger.info({ meetingId }, 'worker: already processed or unknown; acking');
     await stopVmIfQuiet(meetingId, deps);
     return { kind: 'already-processed' };
